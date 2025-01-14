@@ -1,0 +1,13 @@
+/* FastRPC IDL interface */
+
+#ifndef HTP_OPS_IDL
+#define HTP_OPS_IDL
+
+#include "AEEStdDef.idl"
+#include "remote.idl"
+
+interface htp_ops : remote_handle64 {
+    AEEResult init_backend();
+};
+
+#endif /* HTP_OPS_IDL */
