@@ -62,6 +62,8 @@ else()
     add_library(htp_ops_skel SHARED
         ${CMAKE_CURRENT_BINARY_DIR}/htp_ops_skel.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/commu.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/power.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/rms_norm.c
     )
     build_idl(include/htp_ops.idl htp_ops_skel)
 

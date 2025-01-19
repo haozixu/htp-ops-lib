@@ -7,6 +7,10 @@
 
 static remote_handle64 session_handle = -1;  // global session handle
 
+remote_handle64 get_global_handle() {
+  return session_handle;
+}
+
 int open_dsp_session(int domain_id, int unsigned_pd_enabled) {
   int   err        = AEE_SUCCESS;
   char *uri_domain = NULL;
