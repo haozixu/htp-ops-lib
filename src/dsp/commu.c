@@ -24,6 +24,8 @@ AEEResult htp_ops_open(const char *uri, remote_handle64 *handle) {
 
 // FastRPC interface
 AEEResult htp_ops_close(remote_handle64 handle) {
+  reset_power();
+
   return AEE_SUCCESS;
 }
 
@@ -58,9 +60,11 @@ AEEResult htp_ops_rms_norm_f32(remote_handle64 handle, int32 fd0, int32 offset0,
     goto bail;
   }
 
+  int64_t t1 = HAP_perf_get_qtimer_count();
+
   const float *input = (float *) (p1 + offset1);
-  // size_t input_size = ne0 * ne1 * sizeof(float); // This can be inaccurate
-  // qurt_mem_cache_clean((qurt_addr_t) input, input_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+  size_t input_size = ne0 * ne1 * sizeof(float); // This can be inaccurate
+  qurt_mem_cache_clean((qurt_addr_t) input, input_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
 
   float *output = (float *) (p0 + offset0);
   err           = hvx_rms_norm_f32(output, input, ne0, ne1);
@@ -73,6 +77,8 @@ AEEResult htp_ops_rms_norm_f32(remote_handle64 handle, int32 fd0, int32 offset0,
   size_t output_size = ne0 * ne1 * sizeof(float);  // This can be inaccurate
   err                = qurt_mem_cache_clean((qurt_addr_t) output, output_size, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 
+  int64_t t2 = HAP_perf_get_qtimer_count();
+
 bail:
   if (p0) {
     HAP_mmap_put(fd0);
@@ -82,6 +88,7 @@ bail:
   }
 
   int64_t elapsed = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
-  FARF(ALWAYS, "rms_norm_f32 took %ld us", elapsed);
+  FARF(ALWAYS, "rms_norm_f32 (ne0=%d, ne1=%d) took %ld us", ne0, ne1, elapsed);
+  FARF(ALWAYS, "    core + cache inv+flush: %ld us", HAP_perf_qtimer_count_to_us(t2 - t1));
   return err;
 }
