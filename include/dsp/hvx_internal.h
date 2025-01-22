@@ -57,7 +57,7 @@ typedef union {
     uint32_t    qf32_array[32];
     float       float32_array[32];
     HVX_Vector  vector;
-}qhl_hvx_vector_array;
+} qhl_hvx_vector_array;
 
 static HVX_INLINE_ALWAYS void l2fetch(const void *p, uint32_t stride,
                                       uint32_t width, uint32_t height,

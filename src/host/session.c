@@ -66,8 +66,10 @@ int open_dsp_session(int domain_id, int unsigned_pd_enabled) {
 
   // enable FastRPC QoS mode
   struct remote_rpc_control_latency lat_ctrl;
-  lat_ctrl.enable = 1;
-  err             = remote_handle64_control(session_handle, DSPRPC_CONTROL_LATENCY, &lat_ctrl, sizeof(lat_ctrl));
+  lat_ctrl.enable = RPC_PM_QOS;
+  lat_ctrl.latency = 50; // target latency: 50 us (not guaranteed)
+
+  err = remote_handle64_control(session_handle, DSPRPC_CONTROL_LATENCY, &lat_ctrl, sizeof(lat_ctrl));
   if (err) {
     fprintf(stderr, "Enabling FastRPC QoS mode failed: 0x%08x\n", (unsigned) err);
     goto bail;

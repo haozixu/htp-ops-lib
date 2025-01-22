@@ -5,9 +5,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "host/session.h"
 #include "htp_ops.h"  // auto-generated
+#include "message.h"
+#include "op_reg.h"
 
 static inline int64_t get_time_us() {
   struct timespec ts;
@@ -55,7 +58,7 @@ static void rms_norm_f32_ref(float *dst, const float *src, int ne0, int ne1) {
 
   for (int j = 0; j < ne1; ++j) {
     const float *x = src + j * ne0;
-    float *y = dst + j * ne0;
+    float       *y = dst + j * ne0;
 
     float sum = 0;
     for (int i = 0; i < ne0; ++i) {
@@ -72,7 +75,7 @@ static void rms_norm_f32_ref(float *dst, const float *src, int ne0, int ne1) {
   }
 }
 
-static void test_rms_norm_f32(remote_handle64 handle, int ne0) {
+static void test_rms_norm_f32_rpc(remote_handle64 handle, int ne0) {
   float *src, *dsp_dst, *ref_dst;
   int    fd_src, fd_dst;
 
@@ -94,9 +97,9 @@ static void test_rms_norm_f32(remote_handle64 handle, int ne0) {
     src[i] = (rand() % 20000) * 2e-3f - 20.0f;
   }
 
-  int64_t t0 = get_time_us();
-  err = htp_ops_rms_norm_f32(handle, fd_dst, 0, fd_src, 0, ne0, 1);
-  int64_t rpc_elapsed_us = get_time_us() - t0; 
+  int64_t t0             = get_time_us();
+  err                    = htp_ops_rms_norm_f32(handle, fd_dst, 0, fd_src, 0, ne0, 1);
+  int64_t rpc_elapsed_us = get_time_us() - t0;
   fprintf(stderr, "rms_norm_f32 RPC took %ld us\n", rpc_elapsed_us);
 
   if (err != 0) {
@@ -106,7 +109,7 @@ static void test_rms_norm_f32(remote_handle64 handle, int ne0) {
   rms_norm_f32_ref(ref_dst, src, ne0, 1);
 
   int   n_failed = 0;
-  float tol       = 1e-5;
+  float tol      = 1e-5;
   for (int i = 0; i < ne0; ++i) {
     if (fabs(ref_dst[i] - dsp_dst[i]) > tol) {
       n_failed++;
@@ -132,6 +135,139 @@ end:
   return;
 }
 
+static void test_rms_norm_f32_chan(void *chan, int ne0) {
+  struct MessageHeader *msg = (struct MessageHeader *) chan;
+
+  float *src, *dsp_dst, *ref_dst;
+  int    fd_src, fd_dst;
+
+  int err, passed = 0;
+
+  src = dsp_dst = ref_dst = NULL;
+  size_t size             = align_up(ne0 * sizeof(float), 128);
+
+  if (alloc_shared_mem_buf((void **) &src, &fd_src, size)) {
+    goto end;
+  }
+  if (alloc_shared_mem_buf((void **) &dsp_dst, &fd_dst, size)) {
+    goto end;
+  }
+  ref_dst = (float *) malloc(size);
+
+  // fill data, [0, 20000] -> [-20, 20]
+  for (int i = 0; i < ne0; ++i) {
+    src[i] = (rand() % 20000) * 2e-3f - 20.0f;
+  }
+
+  {
+    struct RequestHeader req_hdr = {
+      .state = 0,
+      .type  = REQUEST_TYPE_OP_COMPUTE,
+    };
+    struct OpComputeRequest compute_req = {
+      .op = HTP_OPS_RMS_NORM_F32,
+    };
+    struct RmsNormF32Params params = {
+      .dst = { .fd = fd_dst, .offset = 0, },
+      .src = { .fd = fd_src, .offset = 0, },
+      .ne0 = ne0,
+      .ne1 = 1,
+    };
+
+    size_t req_size     = sizeof(req_hdr) + sizeof(compute_req) + sizeof(params);
+    msg->state.d        = 0;
+    msg->n_reqs         = 1;
+    msg->req_offsets[0] = message_header_size(msg);
+    msg->req_offsets[1] = msg->req_offsets[0] + req_size;
+
+    uint8_t *p                  = (uint8_t *) message_header_get_request_ptr(msg, 0);
+    *(struct RequestHeader *) p = req_hdr;
+    p += sizeof(struct RequestHeader);
+    *(struct OpComputeRequest *) p = compute_req;
+    p += sizeof(struct OpComputeRequest);
+    *(struct RmsNormF32Params *) p = params;
+    p += sizeof(struct RmsNormF32Params);
+  }
+
+  int64_t t0      = get_time_us();
+  msg->state.v[0] = 1;
+  while (msg->state.v[1] != 1) {
+    // usleep(10);
+  }
+  int64_t chan_elapsed_us = get_time_us() - t0;
+  fprintf(stderr, "rms_norm_f32 CHAN took %ld us\n", chan_elapsed_us);
+
+  err = message_header_get_request_ptr(msg, 0)->state;
+  if (err != 0) {
+    fprintf(stderr, "%s: CHAN failed with %x\n", __func__, err);
+    goto end;
+  }
+  rms_norm_f32_ref(ref_dst, src, ne0, 1);
+
+  int   n_failed = 0;
+  float tol      = 1e-5;
+  for (int i = 0; i < ne0; ++i) {
+    if (fabs(ref_dst[i] - dsp_dst[i]) > tol) {
+      n_failed++;
+      if (n_failed < 16) {
+        fprintf(stderr, "%s: index %d, ref val=%.5f, dsp val=%.5f\n", __func__, i, ref_dst[i], dsp_dst[i]);
+      }
+    }
+  }
+  passed = (n_failed == 0);
+
+  // extra test: trigger DSP-side mapping reclaimation
+  // fprintf(stderr, "manually unmap fd %d, %d\n", fd_dst, fd_src);
+  // fastrpc_munmap(CDSP_DOMAIN_ID, fd_dst, NULL, 0);
+  // fastrpc_munmap(CDSP_DOMAIN_ID, fd_src, NULL, 0);
+  {
+    struct RequestHeader req_hdr = {
+      .state = 0,
+      .type  = REQUEST_TYPE_RPCMEM_MAP,
+    };
+    struct RpcmemMapRequest map_req = {
+      .n_puts = 2,
+      .n_gets = 0,
+    };
+
+    size_t req_size     = sizeof(req_hdr) + sizeof(map_req) + 2 * sizeof(int);
+    msg->state.d        = 0;
+    msg->n_reqs         = 1;
+    msg->req_offsets[0] = message_header_size(msg);
+    msg->req_offsets[1] = msg->req_offsets[0] + req_size;
+
+    uint8_t *p                  = (uint8_t *) message_header_get_request_ptr(msg, 0);
+    *(struct RequestHeader *) p = req_hdr;
+    p += sizeof(struct RequestHeader);
+    *(struct RpcmemMapRequest *) p = map_req;
+    p += sizeof(struct RpcmemMapRequest);
+
+    // fill in fd data
+    *(int *) p = fd_dst;
+    p += sizeof(int);
+    *(int *) p = fd_src;
+    p += sizeof(int);
+  }
+
+  msg->state.v[0] = 1;
+  while (msg->state.v[1] != 1) {
+    usleep(10);
+  }
+
+end:
+  if (src) {
+    free_shared_mem_buf(src, fd_src);
+  }
+  if (dsp_dst) {
+    free_shared_mem_buf(dsp_dst, fd_dst);
+  }
+  if (ref_dst) {
+    free(ref_dst);
+  }
+
+  fprintf(stderr, passed ? "%s passed\n" : "%s failed\n", __func__);
+}
+
 int main(int argc, char **argv) {
   int err = open_dsp_session(CDSP_DOMAIN_ID, 1);
   if (err != 0) {
@@ -141,8 +277,32 @@ int main(int argc, char **argv) {
 
   init_htp_backend();
 
-  test_rms_norm_f32(get_global_handle(), 60000);
+  test_rms_norm_f32_rpc(get_global_handle(), 60000);
 
+  void        *chan;
+  int          chan_fd;
+  const size_t max_msg_size = 4096;
+
+  err = alloc_shared_mem_buf(&chan, &chan_fd, max_msg_size);
+  if (err) {
+    fprintf(stderr, "Cannot allocate rpcmem for message channel\n");
+    goto skip1;
+  }
+
+  err = htp_ops_create_channel(get_global_handle(), chan_fd, max_msg_size);
+  if (err) {
+    fprintf(stderr, "Create channel failed\n");
+    goto skip2;
+  }
+
+  test_rms_norm_f32_chan(chan, 60000);
+
+  htp_ops_destroy_channel(get_global_handle());
+
+skip2:
+  free_shared_mem_buf(chan, chan_fd);
+
+skip1:
   close_dsp_session();
   return 0;
 }
