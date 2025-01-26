@@ -90,3 +90,7 @@ void close_dsp_session() {
 void init_htp_backend() {
   htp_ops_init_backend(session_handle);
 }
+
+int create_htp_message_channel(int fd, unsigned int max_msg_size) {
+  return htp_ops_create_channel(session_handle, fd, max_msg_size);
+}

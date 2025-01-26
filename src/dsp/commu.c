@@ -35,7 +35,7 @@ static void msg_receiver_loop(void *param) {
   struct MessageChannel *chan = (struct MessageChannel *) param;
   qurt_signal_set(&(chan->msg_receiver_ready), 1);
 
-  const int SLEEP_TIME_US = 20;
+  const int SLEEP_TIME_US = 5;
 
   while (1) {
     if (chan->msg_receiver_should_stop) {
