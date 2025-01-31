@@ -48,8 +48,8 @@ int alloc_shared_mem_buf(void **p_buf, int *p_fd, size_t size) {
   return 0;
 }
 
-void free_shared_mem_buf(void *buf, int fd) {
-  fastrpc_munmap(CDSP_DOMAIN_ID, fd, NULL, 0);
+void free_shared_mem_buf(void *buf, int fd, size_t size) {
+  fastrpc_munmap(CDSP_DOMAIN_ID, fd, buf, size);
   rpcmem_free(buf);
 }
 
@@ -122,10 +122,10 @@ static void test_rms_norm_f32_rpc(remote_handle64 handle, int ne0) {
 
 end:
   if (src) {
-    free_shared_mem_buf(src, fd_src);
+    free_shared_mem_buf(src, fd_src, size);
   }
   if (dsp_dst) {
-    free_shared_mem_buf(dsp_dst, fd_dst);
+    free_shared_mem_buf(dsp_dst, fd_dst, size);
   }
   if (ref_dst) {
     free(ref_dst);
@@ -256,10 +256,10 @@ static void test_rms_norm_f32_chan(void *chan, int ne0) {
 
 end:
   if (src) {
-    free_shared_mem_buf(src, fd_src);
+    free_shared_mem_buf(src, fd_src, size);
   }
   if (dsp_dst) {
-    free_shared_mem_buf(dsp_dst, fd_dst);
+    free_shared_mem_buf(dsp_dst, fd_dst, size);
   }
   if (ref_dst) {
     free(ref_dst);
@@ -300,7 +300,7 @@ int main(int argc, char **argv) {
   htp_ops_destroy_channel(get_global_handle());
 
 skip2:
-  free_shared_mem_buf(chan, chan_fd);
+  free_shared_mem_buf(chan, chan_fd, max_msg_size);
 
 skip1:
   close_dsp_session();
