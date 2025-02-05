@@ -2,11 +2,12 @@
 
 #include <HAP_farf.h>
 #include <HAP_power.h>
-#include <string.h>
+
+static int power_ctx;
 
 // TODO(hzx): maybe we should set params according to SoC model
-void setup_power() {
-  static int power_ctx;
+void power_setup() {
+  int err;
 
   HAP_power_request_t req;
   memset(&req, 0, sizeof(req));
@@ -28,22 +29,31 @@ void setup_power() {
   req.dcvs_v3.bus_params.max_corner    = HAP_DCVS_VCORNER_TURBO_PLUS;
   req.dcvs_v3.bus_params.target_corner = HAP_DCVS_VCORNER_TURBO_PLUS;
 
-  int ret = HAP_power_set(&power_ctx, &req);
-  if (ret != AEE_SUCCESS) {
-    FARF(ALWAYS, "HAP_power_set DCVS v3 failed");
+  err = HAP_power_set(&power_ctx, &req);
+  if (err != AEE_SUCCESS) {
+    FARF(ALWAYS, "HAP_power_set DCVS v3 failed with return code 0x%x", err);
+  }
+
+  // power on HMX
+  // NOTE(hzx): should we use v2 to set HMX clock frequency?
+  memset(&req, 0, sizeof(req));
+  req.type         = HAP_power_set_HMX;
+  req.hmx.power_up = TRUE;
+
+  err = HAP_power_set(&power_ctx, &req);
+  if (err != AEE_SUCCESS) {
+    FARF(ALWAYS, "HAP_power_set HMX failed with return code 0x%x", err);
   }
 }
 
-void reset_power() {
-  static int power_ctx;
+void power_reset() {
+  HAP_power_request_t req;
 
-  HAP_power_request_t request;
-  memset(&request, 0, sizeof(HAP_power_request_t));
-  request.type                    = HAP_power_set_DCVS_v3;
-  request.dcvs_v3.set_dcvs_enable = TRUE;
-  request.dcvs_v3.set_latency     = TRUE;
-  request.dcvs_v3.latency         = 65535;
-  request.dcvs_v3.set_core_params = TRUE;
-  request.dcvs_v3.set_bus_params  = TRUE;
-  HAP_power_set(&power_ctx, &request);
+  memset(&req, 0, sizeof(req));
+  req.type         = HAP_power_set_HMX;
+  req.hmx.power_up = FALSE;
+  HAP_power_set(&power_ctx, &req);
+
+  HAP_power_set_dcvs_v3_init(&req);
+  HAP_power_set(&power_ctx, &req);
 }

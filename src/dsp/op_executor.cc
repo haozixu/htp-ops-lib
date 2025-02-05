@@ -55,6 +55,25 @@ int execute_op_simple(struct OpComputeRequest *req) {
       }
       break;
 
+    case HTP_OPS_MAT_MUL_PERMUTED_W16A32:
+      {
+        auto params = reinterpret_cast<MatMulPermutedW16A32Params *>(req->payload);
+        int  m = params->m, k = params->k, n = params->n;
+
+        size_t output_size     = m * n * sizeof(float);
+        size_t activation_size = m * k * sizeof(float);
+        size_t weight_size     = k * n * sizeof(__fp16);
+
+        add_buffer(out_bufs, params->output, output_size);
+        add_buffer(in_bufs, params->activation, activation_size);
+        add_buffer(in_bufs, params->weight, weight_size);
+
+        validate_in_bufs();
+        ret = hmx_mat_mul_permuted_w16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), m, k, n);
+        validate_out_bufs();
+      }
+      break;
+
     default:
       break;
   }

@@ -22,6 +22,10 @@ static inline int align_up(size_t size, size_t align) {
   return (size + align - 1) / align * align;
 }
 
+static inline double rand_01() {
+  return ((double) rand()) / RAND_MAX;
+}
+
 // assert p_buf, p_fd and size are always valid
 int alloc_shared_mem_buf(void **p_buf, int *p_fd, size_t size) {
   void *buf = rpcmem_alloc(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_FLAG_UNCACHED, size);
@@ -268,6 +272,73 @@ end:
   fprintf(stderr, passed ? "%s passed\n" : "%s failed\n", __func__);
 }
 
+static void test_mat_mul_rpc(remote_handle64 handle) {
+  float *activation, *output;
+  __fp16 *weight;
+
+  int output_fd, activation_fd, weight_fd;
+
+  int m = 1;
+  int k = 1024;
+  // int n = 608; // 576 | 608
+  int n = 1024;
+
+  alloc_shared_mem_buf((void **) &output, &output_fd, m * n * sizeof(float));
+  alloc_shared_mem_buf((void **) &activation, &activation_fd, m * k * sizeof(float));
+  alloc_shared_mem_buf((void **) &weight, &weight_fd, k * n * sizeof(__fp16));
+
+  float *weight_ref = (float *) malloc(n * k * sizeof(float));
+  float *output_ref = (float *) malloc(m * n * sizeof(float));
+  memset(output_ref, 0, m * n * sizeof(float));
+
+  __fp16 *output_f16 = (__fp16 *) malloc(m * n * sizeof(__fp16));
+  memset(output_f16, 0, m * n * sizeof(__fp16));
+
+  float *output_mix = (float *) malloc(m * n * sizeof(float));
+  memset(output_mix, 0, m * n * sizeof(float));
+
+  for (int i = 0; i < m; ++i)
+    for (int j = 0; j < k; ++j)
+      activation[i * k + j] = rand_01();
+  for (int i = 0; i < k; ++i) {
+    for (int j = 0; j < n; ++j) {
+      float x = rand_01();
+
+      int i0 = i / 32, i1 = i % 32;
+      int j0 = j / 32, j1 = j % 32;
+
+      int tile_idx = j0 * (k / 32) + i0;
+      __fp16 *tile = weight + tile_idx * 1024;
+      tile[(i1 & ~1) * 32 + j1 * 2 + (i1 & 1)] = (__fp16) x;
+      weight_ref[i * n + j] = x;
+    }
+  }
+
+  htp_ops_mat_mul_permuted_w16a32(handle, output_fd, 0, activation_fd, 0, weight_fd, 0, m, k, n);
+
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < n; ++j) {
+      for (int l = 0; l < k; ++l) {
+        output_ref[i * n + j] += activation[i * k + l] * weight_ref[l * n + j];
+        output_f16[i * n + j] += (__fp16)(((__fp16) activation[i * k + l]) * ((__fp16) weight_ref[l * n + j]));
+        output_mix[i * n + j] += (float)((__fp16) activation[i * k + l] * ((__fp16) weight_ref[l * n + j]));
+      }
+    }
+  }
+
+  for (int i = 0; i < m * n; ++i)
+    printf("#%d hmx: %g, f32: %g, f16: %g, mix: %g\n", i, output[i], output_ref[i], output_f16[i], output_mix[i]);
+
+  free(weight_ref);
+  free(output_ref);
+  free(output_f16);
+  free(output_mix);
+
+  free_shared_mem_buf(output, output_fd, m * n * sizeof(float));
+  free_shared_mem_buf(activation, activation_fd, m * k * sizeof(float));
+  free_shared_mem_buf(weight, weight_fd, k * n * sizeof(__fp16));
+}
+
 int main(int argc, char **argv) {
   int err = open_dsp_session(CDSP_DOMAIN_ID, 1);
   if (err != 0) {
@@ -277,6 +348,9 @@ int main(int argc, char **argv) {
 
   init_htp_backend();
 
+  test_mat_mul_rpc(get_global_handle());
+
+  /*
   test_rms_norm_f32_rpc(get_global_handle(), 60000);
 
   void        *chan;
@@ -301,6 +375,7 @@ int main(int argc, char **argv) {
 
 skip2:
   free_shared_mem_buf(chan, chan_fd, max_msg_size);
+  */
 
 skip1:
   close_dsp_session();

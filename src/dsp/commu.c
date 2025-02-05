@@ -7,14 +7,17 @@
 #include <qurt_memory.h>
 #include <qurt_signal.h>
 #include <qurt_thread.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
+#include "dsp/hmx_mgr.h"
 #include "dsp/mmap_mgr.h"
 #include "dsp/op_executor.h"
 #include "dsp/ops.h"
 #include "dsp/power.h"
+#include "dsp/vtcm_mgr.h"
 #include "htp_ops.h"  // QAIC auto-generated header for FastRPC
 #include "message.h"
 
@@ -36,6 +39,9 @@ static void msg_receiver_loop(void *param) {
   qurt_signal_set(&(chan->msg_receiver_ready), 1);
 
   const int SLEEP_TIME_US = 5;
+
+  // TODO(hzx): using the poller thread to do computation may not be a good idea
+  hmx_manager_enable_execution();
 
   while (1) {
     if (chan->msg_receiver_should_stop) {
@@ -81,13 +87,16 @@ static void msg_receiver_loop(void *param) {
       }
     }
 
-    msg_hdr->state.v[1] = 1;
+    atomic_uchar *v1_ptr = (atomic_uchar *) &(msg_hdr->state.v[1]);
+    atomic_store_explicit(v1_ptr, 1, memory_order_release);
     // flush cache
     qurt_mem_cache_clean((qurt_addr_t) msg_hdr, message_total_size(msg_hdr), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 
     // TODO(hzx): estimate host's job completion time and sleep
     qurt_sleep(SLEEP_TIME_US);
   }
+
+  hmx_manager_disable_execution();
 }
 
 // init an empty (semantically unintialized) message channel
@@ -112,15 +121,13 @@ int message_channel_create(struct MessageChannel *chan, int rpcmem_fd, size_t ma
   }
 
   // clear message state
-  for (int i = 0; i < sizeof(struct MessageState); ++i) {
-    p[i] = 0;
-  }
+  memset(p, 0, max_msg_size);
 
   chan->msg_receiver_should_stop = false;
   qurt_signal_init(&(chan->msg_receiver_ready));
 
   const size_t stack_size = 8192;
-  void *stack = memalign(4096, stack_size);
+  void        *stack      = memalign(4096, stack_size);
   if (!stack) {
     FARF(ALWAYS, "%s: failed to allocate memory for thread stack", __func__);
     qurt_signal_destroy(&(chan->msg_receiver_ready));
@@ -182,7 +189,10 @@ AEEResult htp_ops_open(const char *uri, remote_handle64 *handle) {
 AEEResult htp_ops_close(remote_handle64 handle) {
   mmap_manager_release_all();
   message_channel_destroy(&global_msg_chan);
-  reset_power();
+
+  hmx_manager_reset();
+  vtcm_manager_reset();
+  power_reset();
 
   return AEE_SUCCESS;
 }
@@ -191,7 +201,9 @@ AEEResult htp_ops_close(remote_handle64 handle) {
 AEEResult htp_ops_init_backend(remote_handle64 handle) {
   FARF(ALWAYS, "init_backend called");
 
-  setup_power();
+  power_setup();
+  vtcm_manager_setup();
+  hmx_manager_setup();
 
   return AEE_SUCCESS;
 }
@@ -261,5 +273,73 @@ bail:
   int64_t elapsed = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
   FARF(ALWAYS, "rms_norm_f32 (ne0=%d, ne1=%d) took %ld us", ne0, ne1, elapsed);
   FARF(ALWAYS, "    core + cache inv+flush: %ld us", HAP_perf_qtimer_count_to_us(t2 - t1));
+  return err;
+}
+
+// FastRPC interface
+AEEResult htp_ops_mat_mul_permuted_w16a32(remote_handle64 handle, int32 output_fd, int32 output_offset,
+                                          int32 activation_fd, int32 activation_offset, int32 weight_fd,
+                                          int32 weight_offset, int32 m, int32 k, int32 n) {
+  uint8_t *p0, *p1, *p2;
+  p0 = p1 = p2 = NULL;
+
+  int err = HAP_mmap_get(output_fd, (void **) &p0, NULL);
+  if (err) {
+    FARF(ALWAYS, "HAP_mmap_get failed: %d", err);
+    goto bail;
+  }
+
+  err = HAP_mmap_get(activation_fd, (void **) &p1, NULL);
+  if (err) {
+    FARF(ALWAYS, "HAP_mmap_get failed: %d", err);
+    goto bail;
+  }
+
+  err = HAP_mmap_get(weight_fd, (void **) &p2, NULL);
+  if (err) {
+    FARF(ALWAYS, "HAP_mmap_get failed: %d", err);
+    goto bail;
+  }
+
+  float        *output     = (float *) (p0 + output_offset);
+  const float  *activation = (const float *) (p1 + activation_offset);
+  const __fp16 *weight     = (const __fp16 *) (p2 + weight_offset);
+
+  size_t output_size     = m * n * sizeof(float);
+  size_t activation_size = m * k * sizeof(float);
+  size_t weight_size     = k * n * sizeof(__fp16);
+
+  qurt_mem_cache_clean((qurt_addr_t) activation, activation_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+  qurt_mem_cache_clean((qurt_addr_t) weight, weight_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
+
+  // static char print_buf[256];
+
+  // const uint16_t *w = (const uint16_t *) weight;
+  // sprintf(print_buf, "%s: weight digest %04x %04x %04x %04x | %04x %04x", __func__, w[0], w[1], w[2], w[3], w[64], w[65]);
+  // FARF(ALWAYS, "%s", print_buf);
+
+  // const float *a = activation;
+  // sprintf(print_buf, "%s: activa digest %g %g %g %g", __func__, a[0], a[1], a[2], a[3]);
+  // FARF(ALWAYS, "%s", print_buf);
+
+  hmx_manager_enable_execution();
+  err = hmx_mat_mul_permuted_w16a32(output, activation, weight, m, k, n);
+  hmx_manager_disable_execution();
+
+  // sprintf(print_buf, "%s: output digest %g %g %g %g", __func__, output[0], output[1], output[2], output[3]);
+  // FARF(ALWAYS, "%s", print_buf);
+
+  qurt_mem_cache_clean((qurt_addr_t) output, output_size, QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+
+bail:
+  if (p0) {
+    HAP_mmap_put(output_fd);
+  }
+  if (p1) {
+    HAP_mmap_put(activation_fd);
+  }
+  if (p2) {
+    HAP_mmap_put(weight_fd);
+  }
   return err;
 }

@@ -67,11 +67,19 @@ else()
         ${CMAKE_CURRENT_BINARY_DIR}/htp_ops_skel.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/commu.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/power.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/hmx_mgr.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/vtcm_mgr.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/mat_mul.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/rms_norm.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/worker_pool.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/mmap_mgr.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/op_executor.cc
     )
     build_idl(include/htp_ops.idl htp_ops_skel)
+
+    # Enable HMX inline assembly
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -mhmx")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mhmx")
 
     # Link C++ libraries
     target_link_libraries(htp_ops_skel ${HEXAGON_LIB_DIR}/${HEXAGON_ARCH}/G0/pic/libc++abi.so.1)

@@ -4,8 +4,8 @@
 extern "C" {
 #endif
 
-void setup_power();
-void reset_power();
+void power_setup();
+void power_reset();
 
 #ifdef __cplusplus
 }
