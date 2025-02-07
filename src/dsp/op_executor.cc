@@ -8,6 +8,35 @@
 #include "dsp/ops.h"
 #include "op_reg.h"
 
+namespace {
+
+size_t ggml_super_block_size(enum ggml_type type) {
+  // TODO: more types
+  switch (type) {
+    case GGML_TYPE_Q4_0:
+      return sizeof(my_block_q4_0);
+    case GGML_TYPE_Q8_0:
+      return sizeof(my_block_q8_0);
+    default:
+      return -1;
+  }
+}
+
+enum ggml_type matmul_op_to_weight_type(enum HtpOpsIndex op) {
+  switch (op) {
+    case HTP_OPS_MAT_MUL_PERMUTED_W16A32:
+      return GGML_TYPE_F16;
+    case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
+      return GGML_TYPE_Q4_0;
+    case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
+      return GGML_TYPE_Q8_0;
+    default:
+      return GGML_TYPE_COUNT;  // invalid type
+  }
+}
+
+}  // namespace
+
 extern "C" {
 
 #define IN_PTR(i)  in_bufs[i].first
@@ -75,20 +104,25 @@ int execute_op_simple(struct OpComputeRequest *req) {
       break;
 
     case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
+    case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
       {
+        auto   weight_type      = matmul_op_to_weight_type(static_cast<HtpOpsIndex>(req->op));
+        size_t super_block_size = ggml_super_block_size(weight_type);
+
         auto params = reinterpret_cast<MatMulParams *>(req->payload);
         int  m = params->m, k = params->k, n = params->n;
 
         size_t output_size     = m * n * sizeof(float);
         size_t activation_size = m * k * sizeof(float);
-        size_t weight_size     = k * n / QK_K * sizeof(my_block_q4_0);
+        size_t weight_size     = k * n / QK_K * super_block_size;
 
         add_buffer(out_bufs, params->output, output_size);
         add_buffer(in_bufs, params->activation, activation_size);
         add_buffer(in_bufs, params->weight, weight_size);
 
         validate_in_bufs();
-        ret = hmx_mat_mul_permuted_w4d16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), (my_block_q4_0 *) IN_PTR(1), m, k, n);
+        ret =
+          hmx_mat_mul_permuted_qk_0_d16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), IN_PTR(1), m, k, n, weight_type);
         validate_out_bufs();
       }
       break;
