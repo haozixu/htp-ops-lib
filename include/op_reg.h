@@ -5,6 +5,7 @@
 enum HtpOpsIndex {
   HTP_OPS_RMS_NORM_F32,
   HTP_OPS_MAT_MUL_PERMUTED_W16A32,
+  HTP_OPS_MAT_MUL_PERMUTED_W4D16A32,
   HTP_OPS_COUNT,
 };
 
@@ -20,7 +21,7 @@ struct RmsNormF32Params {
   int32_t       ne1;
 } __attribute__((packed));
 
-struct MatMulPermutedW16A32Params {
+struct MatMulParams {
   struct RpcmemBufAddr output;
   struct RpcmemBufAddr activation; // m * k
   struct RpcmemBufAddr weight; // k * n

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dsp/quants.h"
+
 #ifndef restrict
 #define restrict __restrict
 #endif
@@ -10,6 +12,7 @@ extern "C" {
 
 int hvx_rms_norm_f32(float *restrict dst, const float *restrict src, int ne0, int ne1);
 int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *activation, const __fp16 *permuted_weight, int m, int k, int n);
+int hmx_mat_mul_permuted_w4d16a32(float *restrict dst, const float *activation, const my_block_q4_0 *permuted_weight, int m, int k, int n);
 
 #ifdef __cplusplus
 }

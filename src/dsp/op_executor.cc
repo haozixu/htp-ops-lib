@@ -57,7 +57,7 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
     case HTP_OPS_MAT_MUL_PERMUTED_W16A32:
       {
-        auto params = reinterpret_cast<MatMulPermutedW16A32Params *>(req->payload);
+        auto params = reinterpret_cast<MatMulParams *>(req->payload);
         int  m = params->m, k = params->k, n = params->n;
 
         size_t output_size     = m * n * sizeof(float);
@@ -70,6 +70,25 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
         validate_in_bufs();
         ret = hmx_mat_mul_permuted_w16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), m, k, n);
+        validate_out_bufs();
+      }
+      break;
+
+    case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
+      {
+        auto params = reinterpret_cast<MatMulParams *>(req->payload);
+        int  m = params->m, k = params->k, n = params->n;
+
+        size_t output_size     = m * n * sizeof(float);
+        size_t activation_size = m * k * sizeof(float);
+        size_t weight_size     = k * n / QK_K * sizeof(my_block_q4_0);
+
+        add_buffer(out_bufs, params->output, output_size);
+        add_buffer(in_bufs, params->activation, activation_size);
+        add_buffer(in_bufs, params->weight, weight_size);
+
+        validate_in_bufs();
+        ret = hmx_mat_mul_permuted_w4d16a32((float *) OUT_PTR(0), (float *) IN_PTR(0), (my_block_q4_0 *) IN_PTR(1), m, k, n);
         validate_out_bufs();
       }
       break;

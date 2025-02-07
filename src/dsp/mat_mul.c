@@ -6,6 +6,7 @@
 #include "dsp/hmx_mgr.h"
 #include "dsp/hmx_utils.h"
 #include "dsp/hvx_internal.h"
+#include "dsp/quants.h"
 #include "dsp/utils.h"
 #include "dsp/vtcm_mgr.h"
 #include "dsp/worker_pool.h"
@@ -150,8 +151,8 @@ static void transfer_permuted_weight_chunk_fp16(__fp16 *vtcm_dst, const __fp16 *
   // size_t n_chunks_per_task = 1;
 
   permuted_weight_transfer_fp16_task_state_t state;
-  state.task_id           = 0;  // task id counter
-  state.n_tasks           = ceil_div(n_tot_chunks, n_chunks_per_task); // old value: n_cols / HMX_FP16_TILE_N_COLS
+  state.task_id           = 0;                                          // task id counter
+  state.n_tasks           = ceil_div(n_tot_chunks, n_chunks_per_task);  // old value: n_cols / HMX_FP16_TILE_N_COLS
   state.n_tot_chunks      = n_tot_chunks;
   state.n_chunks_per_task = n_chunks_per_task;
   state.k                 = k;
@@ -160,6 +161,127 @@ static void transfer_permuted_weight_chunk_fp16(__fp16 *vtcm_dst, const __fp16 *
 
   worker_pool_job_t job;
   job.fptr = transfer_permuted_weight_fp16_worker_loop;
+  job.dptr = &state;
+
+  worker_pool_synctoken_init(&(state.sync_ctx), n_workers);
+  for (int i = 0; i < n_workers; ++i) {
+    worker_pool_submit(NULL, job);  // use default worker pool
+  }
+  worker_pool_synctoken_wait(&(state.sync_ctx));
+}
+
+typedef struct {
+  worker_synctoken_t   sync_ctx;
+  unsigned int         task_id;
+  int                  n_tasks;
+  int                  n_tot_chunks;
+  int                  n_chunks_per_task;
+  __fp16              *dst;
+  const my_block_q4_0 *src;
+} permuted_weight_dequantize_q4_0_hvx_task_state_t;
+
+static void dequantize_permuted_weight_q4_0_to_fp16_hvx_task(__fp16 *restrict vtcm_dst,
+                                                             const my_block_q4_0 *restrict src, int n_blocks) {
+  const int L2_PREFETCH_N_BLOCKS = 32;  // ~ 4K
+  const int DC_PREFETCH_N_BLOCKS = 4;
+
+  static const __fp16 q4_0_to_fp16_lut[64] __attribute__((aligned(VLEN))) = {
+    -8, 0, -7, 0, -6, 0, -5, 0, -4, 0, -3, 0, -2, 0, -1, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0,
+  };
+  const HVX_Vector vlut_cvt = vmem(q4_0_to_fp16_lut);
+
+  HVX_Vector *pv_out = (HVX_Vector *) vtcm_dst;
+
+  for (int i = 0; i < n_blocks; ++i) {
+    if (i % L2_PREFETCH_N_BLOCKS == 0) {
+      int prefetch_idx = i + L2_PREFETCH_N_BLOCKS;
+      if (prefetch_idx < n_blocks) {
+        size_t prefetch_n_blocks = smin(n_blocks - prefetch_idx, L2_PREFETCH_N_BLOCKS);
+        l2fetch(src + prefetch_idx, sizeof(my_block_q4_0), sizeof(my_block_q4_0), prefetch_n_blocks, 0);
+      }
+    }
+
+    if (i + DC_PREFETCH_N_BLOCKS < n_blocks) {
+      Q6_dcfetch_A((void *) &(src[i + DC_PREFETCH_N_BLOCKS].scales));
+    }
+
+    HVX_Vector qs = vmemu(src[i].quants);
+
+    HVX_Vector vq_lo = qs;  // no need to mask out high 4 bits in each byte since vlut will do that for us
+    HVX_Vector vq_hi = Q6_Vub_vlsr_VubR(qs, 4);
+
+    HVX_VectorPair vp0 = Q6_Wh_vlut16_VbVhR_nomatch(vq_lo, vlut_cvt, 0);
+    HVX_VectorPair vp1 = Q6_Wh_vlut16_VbVhR_nomatch(vq_hi, vlut_cvt, 0);
+
+    __fp16 s0 = src[i].scales[0];
+    __fp16 s1 = src[i].scales[1];
+    __fp16 s2 = src[i].scales[2];
+    __fp16 s3 = src[i].scales[3];
+    __fp16 s4 = src[i].scales[4];
+    __fp16 s5 = src[i].scales[5];
+    __fp16 s6 = src[i].scales[6];
+    __fp16 s7 = src[i].scales[7];
+
+    HVX_Vector vs0 = Q6_Vh_vsplat_R(fp16_to_bits(&s0));
+    HVX_Vector vs1 = Q6_Vh_vsplat_R(fp16_to_bits(&s1));
+    HVX_Vector vs2 = Q6_Vh_vsplat_R(fp16_to_bits(&s2));
+    HVX_Vector vs3 = Q6_Vh_vsplat_R(fp16_to_bits(&s3));
+    HVX_Vector vs4 = Q6_Vh_vsplat_R(fp16_to_bits(&s4));
+    HVX_Vector vs5 = Q6_Vh_vsplat_R(fp16_to_bits(&s5));
+    HVX_Vector vs6 = Q6_Vh_vsplat_R(fp16_to_bits(&s6));
+    HVX_Vector vs7 = Q6_Vh_vsplat_R(fp16_to_bits(&s7));
+
+    HVX_Vector vs0_c = Q6_V_valign_VVR(vs1, vs0, 64);
+    HVX_Vector vs1_c = Q6_V_valign_VVR(vs3, vs2, 64);
+    HVX_Vector vs2_c = Q6_V_valign_VVR(vs5, vs4, 64);
+    HVX_Vector vs3_c = Q6_V_valign_VVR(vs7, vs6, 64);
+
+    *pv_out++ = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_V_lo_W(vp0), vs0_c));
+    *pv_out++ = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_V_hi_W(vp0), vs1_c));
+    *pv_out++ = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_V_lo_W(vp1), vs2_c));
+    *pv_out++ = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(Q6_V_hi_W(vp1), vs3_c));
+  }
+}
+
+static void dequantize_permuted_weight_q4_0_to_fp16_hvx_worker_loop(void *data) {
+  permuted_weight_dequantize_q4_0_hvx_task_state_t *state = (permuted_weight_dequantize_q4_0_hvx_task_state_t *) data;
+
+  while (1) {
+    unsigned int task_id = worker_pool_atomic_inc_return(&(state->task_id)) - 1;
+    if (task_id >= state->n_tasks) {
+      break;
+    }
+
+    int    chunk_idx  = task_id * state->n_chunks_per_task;
+    size_t chunk_size = smin(state->n_tot_chunks - chunk_idx, state->n_chunks_per_task);
+
+    __fp16              *vtcm_dst = state->dst + chunk_idx * QK_K;
+    const my_block_q4_0 *src      = state->src + chunk_idx;
+
+    dequantize_permuted_weight_q4_0_to_fp16_hvx_task(vtcm_dst, src, chunk_size);
+  }
+
+  worker_pool_synctoken_jobdone(&(state->sync_ctx));
+}
+
+static void dequantize_permuted_weight_chunk_q4_0_to_fp16_hvx(__fp16 *vtcm_dst, const my_block_q4_0 *src, int n_cols,
+                                                              int k) {
+  assert(n_cols % HMX_FP16_TILE_N_COLS == 0);
+
+  int    n_workers         = num_hvx128_contexts;
+  size_t n_tot_chunks      = n_cols * k / QK_K;
+  size_t n_chunks_per_task = ceil_div(n_tot_chunks, n_workers);
+
+  permuted_weight_dequantize_q4_0_hvx_task_state_t state;
+  state.task_id           = 0;
+  state.n_tasks           = ceil_div(n_tot_chunks, n_chunks_per_task);
+  state.n_tot_chunks      = n_tot_chunks;
+  state.n_chunks_per_task = n_chunks_per_task;
+  state.dst               = vtcm_dst;
+  state.src               = src;
+
+  worker_pool_job_t job;
+  job.fptr = dequantize_permuted_weight_q4_0_to_fp16_hvx_worker_loop;
   job.dptr = &state;
 
   worker_pool_synctoken_init(&(state.sync_ctx), n_workers);
@@ -347,6 +469,105 @@ int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activ
   // FARF(ALWAYS, "    output    store: %ld us", HAP_perf_qtimer_count_to_us(output_store_time));
 
   // size_t weight_size = k * n * sizeof(__fp16);
+  // float  bandwidth   = 1e-3 * weight_size / HAP_perf_qtimer_count_to_us(weight_load_time);
+  // FARF(ALWAYS, "    weight load bandwidth: %.2f GB/s", bandwidth);
+
+  return 0;
+}
+
+int hmx_mat_mul_permuted_w4d16a32(float *restrict dst, const float *restrict activation,
+                                  const my_block_q4_0 *restrict permuted_weight, int m, int k, int n) {
+  if (!dst || !activation || !permuted_weight || !m || !n || !k) {
+    return -1;
+  }
+  if (k % 32 != 0 || n % 32 != 0) {
+    // TODO(hzx): can we remove this restriction?
+    return -1;
+  }
+  if (!is_aligned(dst, VLEN) || !is_aligned(activation, VLEN) || !is_aligned(permuted_weight, VLEN)) {
+    return -1;
+  }
+
+  const size_t weight_area_size     = WEIGHT_AREA_SIZE;
+  const size_t activation_area_size = ACTIVATION_AREA_SIZE;
+  const size_t output_area_size     = WEIGHT_AREA_SIZE;
+
+  // VTCM layout: weight | activation | output | scales
+  uint8_t *vtcm_ptr        = (uint8_t *) vtcm_manager_get_vtcm_base();
+  __fp16  *vtcm_weight     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, weight_area_size);
+  __fp16  *vtcm_activation = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, activation_area_size);
+  __fp16  *vtcm_output     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, output_area_size);
+  __fp16  *vtcm_scales     = (__fp16 *) vtcm_seq_alloc(&vtcm_ptr, 256);
+
+  hmx_init_column_scales(vtcm_scales, Q6_V_vsplat_R(0x3c00));  // fp16: 1.0
+
+  size_t vec_dot_size       = k * sizeof(__fp16);
+  size_t m_chunk_max_n_rows = align_down(activation_area_size / vec_dot_size, HMX_FP16_TILE_N_ROWS);
+  size_t n_chunk_max_n_cols = align_down(weight_area_size / vec_dot_size, HMX_FP16_TILE_N_COLS);
+
+  size_t m_chunk_n_rows = 0, n_chunk_n_cols = 0;
+  find_chunk_size(m_chunk_max_n_rows, n_chunk_max_n_cols, output_area_size / sizeof(__fp16), HMX_FP16_TILE_N_ROWS,
+                  HMX_FP16_TILE_N_COLS, &m_chunk_n_rows, &n_chunk_n_cols);
+
+  // FARF(ALWAYS, "computed chunk size: %d, %d", m_chunk_n_rows, n_chunk_n_cols);
+  assert(m_chunk_n_rows > 0 && n_chunk_n_cols > 0);
+
+  // int64_t activation_load_time, weight_load_time, hmx_core_time, output_store_time;
+  // activation_load_time = weight_load_time = hmx_core_time = output_store_time = 0;
+
+  for (size_t mr = 0; mr < m; mr += m_chunk_n_rows) {
+    // transfer activation matrix chunk into VTCM
+    size_t n_rows = smin(m - mr, m_chunk_n_rows);
+
+    // int64_t act_t0 = HAP_perf_get_qtimer_count();
+    {
+      const float *activation_chunk = activation + mr * k;
+      transfer_activation_chunk_fp32_to_fp16(vtcm_activation, activation_chunk, n_rows, k);
+    }
+    // activation_load_time += HAP_perf_get_qtimer_count() - act_t0;
+
+    // FARF(ALWAYS, "transfer activation ok, mr = %d, n_rows = %d", mr, n_rows);
+
+    for (size_t nc = 0; nc < n; nc += n_chunk_n_cols) {
+      size_t n_cols = smin(n - nc, n_chunk_n_cols);
+
+      // int64_t wei_t0 = HAP_perf_get_qtimer_count();
+      {
+        const my_block_q4_0 *permuted_weight_chunk = permuted_weight + nc * k / QK_K;
+        dequantize_permuted_weight_chunk_q4_0_to_fp16_hvx(vtcm_weight, permuted_weight_chunk, n_cols, k);
+      }
+      // weight_load_time += HAP_perf_get_qtimer_count() - wei_t0;
+
+      // FARF(ALWAYS, "transfer weight ok, nc = %d, n_cols = %d", nc, n_cols);
+
+      // int64_t core_t0 = HAP_perf_get_qtimer_count();
+      {
+        const int n_row_tiles = ceil_div(n_rows, HMX_FP16_TILE_N_ROWS);
+        const int n_col_tiles = ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
+        core_dot_chunk_fp16(vtcm_output, vtcm_activation, vtcm_weight, vtcm_scales, n_row_tiles, n_col_tiles, k / 32);
+      }
+      // hmx_core_time += HAP_perf_get_qtimer_count() - core_t0;
+
+      // FARF(ALWAYS, "core compute ok, (%d, %d) tiles", n_row_tiles, n_col_tiles);
+
+      // int64_t out_t0 = HAP_perf_get_qtimer_count();
+      {
+        float *output = dst + (mr * n + nc);
+        transfer_output_chunk_fp16_to_fp32(output, vtcm_output, n_rows, n_cols, n);
+      }
+      // output_store_time += HAP_perf_get_qtimer_count() - out_t0;
+
+      // FARF(ALWAYS, "transfer output ok, (%d, %d)", mr, nc);
+    }
+  }
+
+  // FARF(ALWAYS, "%s: m = %d, k = %d, n = %d", __func__, m, k, n);
+  // FARF(ALWAYS, "    activation load: %ld us", HAP_perf_qtimer_count_to_us(activation_load_time));
+  // FARF(ALWAYS, "    weight     load: %ld us", HAP_perf_qtimer_count_to_us(weight_load_time));
+  // FARF(ALWAYS, "    core     matmul: %ld us", HAP_perf_qtimer_count_to_us(hmx_core_time));
+  // FARF(ALWAYS, "    output    store: %ld us", HAP_perf_qtimer_count_to_us(output_store_time));
+
+  // size_t weight_size = k * n / QK_K * sizeof(my_block_q4_0);
   // float  bandwidth   = 1e-3 * weight_size / HAP_perf_qtimer_count_to_us(weight_load_time);
   // FARF(ALWAYS, "    weight load bandwidth: %.2f GB/s", bandwidth);
 
