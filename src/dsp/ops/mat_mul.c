@@ -517,10 +517,10 @@ int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activ
   }
 
   // FARF(ALWAYS, "%s: m = %d, k = %d, n = %d", __func__, m, k, n);
-  // FARF(ALWAYS, "    activation load: %ld us", HAP_perf_qtimer_count_to_us(activation_load_time));
-  // FARF(ALWAYS, "    weight     load: %ld us", HAP_perf_qtimer_count_to_us(weight_load_time));
-  // FARF(ALWAYS, "    core     matmul: %ld us", HAP_perf_qtimer_count_to_us(hmx_core_time));
-  // FARF(ALWAYS, "    output    store: %ld us", HAP_perf_qtimer_count_to_us(output_store_time));
+  // FARF(ALWAYS, "    activation load: %lld us", HAP_perf_qtimer_count_to_us(activation_load_time));
+  // FARF(ALWAYS, "    weight     load: %lld us", HAP_perf_qtimer_count_to_us(weight_load_time));
+  // FARF(ALWAYS, "    core     matmul: %lld us", HAP_perf_qtimer_count_to_us(hmx_core_time));
+  // FARF(ALWAYS, "    output    store: %lld us", HAP_perf_qtimer_count_to_us(output_store_time));
 
   // size_t weight_size = k * n * sizeof(__fp16);
   // float  bandwidth   = 1e-3 * weight_size / HAP_perf_qtimer_count_to_us(weight_load_time);
@@ -629,12 +629,12 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
   }
 
   // FARF(ALWAYS, "%s: m = %d, k = %d, n = %d", __func__, m, k, n);
-  // FARF(ALWAYS, "    activation load: %ld us", HAP_perf_qtimer_count_to_us(activation_load_time));
-  // FARF(ALWAYS, "    weight     load: %ld us", HAP_perf_qtimer_count_to_us(weight_load_time));
-  // FARF(ALWAYS, "    core     matmul: %ld us", HAP_perf_qtimer_count_to_us(hmx_core_time));
-  // FARF(ALWAYS, "    output    store: %ld us", HAP_perf_qtimer_count_to_us(output_store_time));
+  // FARF(ALWAYS, "    activation load: %lld us", HAP_perf_qtimer_count_to_us(activation_load_time));
+  // FARF(ALWAYS, "    weight     load: %lld us", HAP_perf_qtimer_count_to_us(weight_load_time));
+  // FARF(ALWAYS, "    core     matmul: %lld us", HAP_perf_qtimer_count_to_us(hmx_core_time));
+  // FARF(ALWAYS, "    output    store: %lld us", HAP_perf_qtimer_count_to_us(output_store_time));
 
-  // size_t weight_size = k * n / QK_K * sizeof(my_block_q4_0);
+  // size_t weight_size = k * n / QK_K * super_block_size;
   // float  bandwidth   = 1e-3 * weight_size / HAP_perf_qtimer_count_to_us(weight_load_time);
   // FARF(ALWAYS, "    weight load bandwidth: %.2f GB/s", bandwidth);
 

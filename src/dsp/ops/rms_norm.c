@@ -5,8 +5,6 @@
 #define PREFETCH_SIZE   (8 * 1024)
 #define PREFETCH_N_VECS (PREFETCH_SIZE / VLEN)
 
-#include <HAP_farf.h>
-
 void hvx_rms_norm_f32_inner(float *restrict dst, const float *restrict src, int ne0) {
   // TODO(hzx): make eps an input
   const float eps = 1e-5;
@@ -56,7 +54,7 @@ void hvx_rms_norm_f32_inner(float *restrict dst, const float *restrict src, int 
 
   float mean  = sum / ne0;
   float scale = 1.0f / sqrtf(mean + eps);
-  v_scale     = Q6_V_vsplat_R(*(int32_t *) &scale); // fp32_to_bits
+  v_scale     = Q6_V_vsplat_R(*(int32_t *) &scale);  // fp32_to_bits
 
   // assume original input is still in L2 cache
   pv_in          = (const HVX_Vector *) src;
