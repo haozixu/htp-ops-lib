@@ -56,10 +56,36 @@ static void msg_receiver_loop(void *param) {
     // invalidate cache
     qurt_mem_cache_clean((qurt_addr_t) msg_hdr, chan->max_msg_size, QURT_MEM_CACHE_INVALIDATE, QURT_MEM_DCACHE);
 
+    // NOTE(hzx): do we need a barrier here?
+    // asm volatile("barrier" ::: "memory");
+
+    // FIXME: memory order may not be working
+    // volatile _Atomic uint64_t *d_ptr = (volatile _Atomic uint64_t *) &(msg_hdr->state.d);
+    // uint64_t d_val = atomic_load_explicit(d_ptr, memory_order_acquire);
+
+    volatile uint64_t d_val, *d_ptr = &(msg_hdr->state.d);
+    asm volatile("%0 = memd_aq(%1)" : "=r"(d_val) : "r"(d_ptr) : "memory");
+
     // TODO(hzx): use more proper message state
-    if (msg_hdr->state.v[0] == 0 || msg_hdr->state.v[1] != 0) {
+    uint8_t v0 = d_val & 0xff;
+    uint8_t v1 = (d_val >> 8) & 0xff;
+    if (v0 == 0 || v1 != 0) {
       qurt_sleep(SLEEP_TIME_US);
       continue;
+    }
+
+    // simple checksum
+    if (0) {
+      uint32_t  sum   = 0;
+      uint32_t *begin = ((uint32_t *) msg_hdr);
+      uint32_t *end   = begin + chan->max_msg_size / 4;
+      for (uint32_t *p = begin; p < end; ++p) {
+        sum += *p;
+      }
+
+      if (sum != 0) {
+        __builtin_trap();  // die
+      }
     }
 
     for (int i = 0; i < msg_hdr->n_reqs; ++i) {
@@ -87,8 +113,18 @@ static void msg_receiver_loop(void *param) {
       }
     }
 
-    atomic_uchar *v1_ptr = (atomic_uchar *) &(msg_hdr->state.v[1]);
-    atomic_store_explicit(v1_ptr, 1, memory_order_release);
+    // first payload cache flush
+    qurt_mem_cache_clean((qurt_addr_t) msg_hdr, message_total_size(msg_hdr), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
+
+    asm volatile("barrier" ::: "memory");
+
+    // FIXME: memory order may not be working
+    // atomic_uchar *v1_ptr = (atomic_uchar *) &(msg_hdr->state.v[1]);
+    // atomic_store_explicit(v1_ptr, 1, memory_order_release);
+
+    d_val = v0 | (1 << 8);
+    asm volatile("memd_rl(%0):at = %1" ::"r"(d_ptr), "r"(d_val) : "memory");
+
     // flush cache
     qurt_mem_cache_clean((qurt_addr_t) msg_hdr, message_total_size(msg_hdr), QURT_MEM_CACHE_FLUSH, QURT_MEM_DCACHE);
 

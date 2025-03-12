@@ -39,6 +39,8 @@ static inline size_t get_super_block_size(enum ggml_type weight_type) {
 }
 
 static inline int dma_issue_load_from_ddr(dma_desc_1d_t *desc, void *vtcm_dst, const void *src, size_t size) {
+  dma_wait_for_idle();
+
   desc->next       = 0;
   desc->length     = size;
   desc->type       = DMA_DESC_TYPE_1D;
@@ -49,7 +51,6 @@ static inline int dma_issue_load_from_ddr(dma_desc_1d_t *desc, void *vtcm_dst, c
   desc->src        = (uint32_t) src;
   desc->dst        = (uint32_t) vtcm_dst;
 
-  dma_wait_for_idle();
   return dma_submit_one(desc);
 }
 
@@ -692,7 +693,8 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
     void *buf_curr = vtcm_scratch0;
     void *buf_next = vtcm_scratch1;
 
-    dma_desc_1d_t desc;  // NOTE(hzx): make sure the DMA descriptor's lifetime is long enough
+    static dma_desc_1d_t desc
+      __attribute__((aligned(64)));  // NOTE(hzx): make sure the DMA descriptor's lifetime is long enough
 
     // issue async DDR data transfer for the first weight chunk
     {

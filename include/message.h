@@ -12,6 +12,7 @@ struct MessageState {
 
 struct MessageHeader {
   struct MessageState state;
+  uint32_t            checksum;
   int32_t             n_reqs;
   int32_t             req_offsets[0];  // n_reqs + 1 entries
 } __attribute__((packed));
