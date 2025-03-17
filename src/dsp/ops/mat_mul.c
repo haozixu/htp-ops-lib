@@ -6,6 +6,7 @@
 #include "dsp/dma_utils.h"
 #include "dsp/hmx_mgr.h"
 #include "dsp/hmx_utils.h"
+#include "dsp/hvx_convert.h"
 #include "dsp/hvx_internal.h"
 #include "dsp/quants.h"
 #include "dsp/utils.h"
@@ -81,8 +82,6 @@ static void transfer_activation_chunk_fp32_to_fp16(__fp16 *restrict vtcm_dst, co
   assert(input_row_size % VLEN == 0);
   int vecs_per_row = input_row_size / VLEN;
 
-  const HVX_Vector v_zero = Q6_V_vzero();
-
   for (int r = 0; r < n_rows; r += 2) {
     int prefetch_row_idx = r + 2;
     if (prefetch_row_idx < n_rows) {
@@ -99,12 +98,9 @@ static void transfer_activation_chunk_fp32_to_fp16(__fp16 *restrict vtcm_dst, co
     const HVX_Vector *pv_in1 = pv_in0 + vecs_per_row;
     for (int vec_cnt = 0; vec_cnt < vecs_per_row; ++vec_cnt) {
       HVX_Vector v0 = *pv_in0++;
-      HVX_Vector v1 = is_leftover ? v_zero : *pv_in1++;  // next row
+      HVX_Vector v1 = is_leftover ? Q6_V_vzero() : *pv_in1++;  // next row
 
-      HVX_Vector v0_qf32 = Q6_Vqf32_vadd_VsfVsf(v0, v_zero);
-      HVX_Vector v1_qf32 = Q6_Vqf32_vadd_VsfVsf(v1, v_zero);
-
-      HVX_Vector v_out = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(v1_qf32, v0_qf32));
+      HVX_Vector v_out = hvx_my_wsf_to_vhf(v1, v0);
 
       // compute output position
       int c        = vec_cnt * (VLEN / sizeof(float));  // 128/4=32
@@ -153,7 +149,8 @@ static void transfer_permuted_weight_fp16_task(__fp16 *restrict vtcm_dst, const 
   }
 }
 
-static void transfer_permuted_weight_fp16_worker_loop(void *data) {
+static void transfer_permuted_weight_fp16_worker_loop(void *data, int _worker_index) {
+  (void) _worker_index;
   permuted_weight_transfer_fp16_task_state_t *state = (permuted_weight_transfer_fp16_task_state_t *) data;
 
   int k = state->k;
@@ -382,7 +379,8 @@ static void dequantize_permuted_weight_q8_0_to_fp16_hvx_task(__fp16 *restrict vt
   }
 }
 
-static void dequantize_permuted_weight_qk_0_to_fp16_hvx_worker_loop(void *data) {
+static void dequantize_permuted_weight_qk_0_to_fp16_hvx_worker_loop(void *data, int _worker_index) {
+  (void) _worker_index;
   permuted_weight_dequantize_qk_0_hvx_task_state_t *state = (permuted_weight_dequantize_qk_0_hvx_task_state_t *) data;
 
   while (1) {
@@ -463,7 +461,7 @@ static void core_dot_chunk_fp16(__fp16 *output, const __fp16 *activation, const 
       }
 
       __fp16 *out_tile = output + (r * n_col_tiles + c) * HMX_FP16_TILE_N_ELMS;
-      hmx_consume_accumlator_fp16(out_tile);
+      hmx_consume_accumulator_fp16(out_tile);
     }
   }
 
@@ -476,11 +474,6 @@ static void transfer_output_chunk_fp16_to_fp32(float *restrict dst, const __fp16
   assert(n_cols % HMX_FP16_TILE_N_COLS == 0);
   const int n_col_tiles = n_cols / HMX_FP16_TILE_N_COLS;
 
-  const HVX_Vector v_zero    = Q6_V_vzero();
-  const HVX_Vector v_lo_mask = Q6_V_vsplat_R(0x0000ffff);
-  const HVX_Vector v_hi_mask = Q6_V_vsplat_R(0xffff0000);
-  const HVX_Vector v_shift16 = Q6_V_vsplat_R(16);
-
   for (int r = 0; r < n_rows; r += 2) {
     int r0 = r / HMX_FP16_TILE_N_ROWS;
     int r1 = r % HMX_FP16_TILE_N_ROWS;
@@ -492,38 +485,14 @@ static void transfer_output_chunk_fp16_to_fp32(float *restrict dst, const __fp16
 
       HVX_Vector v_src = ((const HVX_Vector *) tile)[r1 / 2];
 
-      // converts fp16 to qf16
-      v_src = Q6_Vqf16_vadd_VhfVhf(v_src, v_zero);
-
-      // adapted from qhmath_hvx_vqf32_convert_vqf16 (in qhmath_hvx_convert.h)
-      // extract packed exp & mantissa
-      HVX_Vector exp_comp = Q6_V_vand_VV(v_src, Q6_Vh_vsplat_R(0x1f));    // exp component: low 5 bits
-      HVX_Vector mantissa = Q6_V_vand_VV(v_src, Q6_Vh_vsplat_R(0xffe0));  // mantissa: bits 5~15
-
-      // Convert qf16 biased exponent to qf32 biased exponent
-      // new exp = exp + ( 127 (qf32 bias) -15(qf16 bias) ) = 112
-      exp_comp = Q6_Vh_vadd_VhVh(exp_comp, Q6_Vh_vsplat_R(112));
-
-      // elements index in v_src: [0, n, 1, n+1, ..., 31, n+31]
-      // unpack into [0, 1, ..., 31], [n, n+1, ..., n+31]
-
-      // unpack exp
-      HVX_Vector exp_comp0 = Q6_V_vand_VV(exp_comp, v_lo_mask);  // keep low 16 bits
-      HVX_Vector exp_comp1 = Q6_Vw_vlsr_VwVw(exp_comp, v_shift16);
-
-      // unpack mantissa + convert qf16 mantissa to qf32 mantissa (left shift 16 bits)
-      HVX_Vector mantissa0 = Q6_Vw_vasl_VwVw(mantissa, v_shift16);
-      HVX_Vector mantissa1 = Q6_V_vand_VV(mantissa, v_hi_mask);  // keep high 16 bits
-
-      // merge qf32 exp + mantissa
-      HVX_Vector v0_qf32 = Q6_Vw_vadd_VwVw(mantissa0, exp_comp0);
-      HVX_Vector v1_qf32 = Q6_Vw_vadd_VwVw(mantissa1, exp_comp1);
+      HVX_VectorPair vp = hvx_my_vhf_to_wsf(v_src);
 
       HVX_Vector *pv_out0 = (HVX_Vector *) (dst + (r * n + c + 0));
       HVX_Vector *pv_out1 = (HVX_Vector *) (dst + (r * n + c + n));  // next row in global memory
-      *pv_out0            = Q6_Vsf_equals_Vqf32(v0_qf32);
+
+      *pv_out0 = Q6_V_lo_W(vp);
       if (r + 1 < n_rows) {
-        *pv_out1 = Q6_Vsf_equals_Vqf32(v1_qf32);
+        *pv_out1 = Q6_V_hi_W(vp);
       }
     }
   }

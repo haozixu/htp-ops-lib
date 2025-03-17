@@ -348,7 +348,9 @@ int main(int argc, char **argv) {
 
   init_htp_backend();
 
-  test_mat_mul_rpc(get_global_handle());
+  // test_mat_mul_rpc(get_global_handle());
+
+  htp_ops_test_ops(get_global_handle());
 
   /*
   test_rms_norm_f32_rpc(get_global_handle(), 60000);

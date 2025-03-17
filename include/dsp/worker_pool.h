@@ -47,7 +47,7 @@ extern "C" {
     TYPEDEF
 ===========================================================================*/
 /// signature of callbacks to be invoked by worker threads
-typedef void (*worker_callback_t)(void *);
+typedef void (*worker_callback_t)(void *, int);
 
 /// Typedef of worker_pool context
 typedef void *worker_pool_context_t;

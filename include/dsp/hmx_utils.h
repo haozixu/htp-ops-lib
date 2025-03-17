@@ -31,7 +31,7 @@ static HMX_INLINE_ALWAYS void hmx_load_tiles_fp16(const __fp16 *row_tiles, const
     : "memory");
 }
 
-static HMX_INLINE_ALWAYS void hmx_consume_accumlator_fp16(__fp16 *out) {
+static HMX_INLINE_ALWAYS void hmx_consume_accumulator_fp16(__fp16 *out) {
   asm volatile(
     "cvt.hf = acc(%0)\n"
     "mxmem(%1, %2) = cvt\n" ::"r"(2),
@@ -43,5 +43,5 @@ static HMX_INLINE_ALWAYS void hmx_consume_accumlator_fp16(__fp16 *out) {
 static HMX_INLINE_ALWAYS void hmx_dot_fp16(__fp16 *out, const __fp16 *row_tiles, const __fp16 *col_tiles,
                                            size_t n_tiles) {
   hmx_load_tiles_fp16(row_tiles, col_tiles, n_tiles);
-  hmx_consume_accumlator_fp16(out);
+  hmx_consume_accumulator_fp16(out);
 }

@@ -86,6 +86,12 @@ typedef union {
   } sync;
 } internal_synctoken_t;
 
+// NOTE(hzx): This structure contains a pointer to worker pool and a worker index
+typedef struct {
+  worker_pool_t *pool;
+  int            worker_index;
+} worker_info_t;
+
 /*===========================================================================
     GLOBAL VARIABLES (per PD)
 ===========================================================================*/
@@ -104,8 +110,11 @@ static worker_pool_context_t static_context = NULL;
 ===========================================================================*/
 // the main workloop for each of the worker threads.
 static void worker_pool_main(void *context) {
+  worker_info_t *info = (worker_info_t *) context;
+  worker_pool_t *me   = info->pool;
+
   // local pointer to owning pool's context
-  worker_pool_t *me = (worker_pool_t *) context;
+  // worker_pool_t *me = (worker_pool_t *) context;
 
   // some local vars to reduce dereferencing inside loop
   qurt_anysignal_t *signal = &me->queued_jobs;
@@ -122,7 +131,7 @@ static void worker_pool_main(void *context) {
       (void) qurt_anysignal_clear(signal, (1 << sig_rx));                 // clear the queued job signal
       (void) qurt_anysignal_set(&me->empty_jobs, (1 << sig_rx));          // send node back to empty list
       qurt_mutex_unlock(mutex);                                           // unlock the mutex
-      job.fptr(job.dptr);                                                 // issue the callback
+      job.fptr(job.dptr, info->worker_index);                             // issue the callback
     } else if (WORKER_KILL_SIGNAL == sig_rx) {
       // don't clear the kill signal, leave it for all the workers to see, and exit
       qurt_mutex_unlock(mutex);
@@ -174,19 +183,21 @@ AEEResult worker_pool_init_with_stack_size(worker_pool_context_t *context, int s
   }
 
   // Allocations
-  int            size     = (stack_size * num_workers) + (sizeof(worker_pool_t));
+  size_t size = (stack_size * num_workers) + (sizeof(worker_pool_t)) + (sizeof(worker_info_t) * num_workers);
+
   unsigned char *mem_blob = (unsigned char *) malloc(size);
   if (!mem_blob) {
     FARF(ERROR, "Could not allocate memory for worker pool!!");
     return AEE_ENOMEMORY;
   }
 
-  worker_pool_t *me = (worker_pool_t *) (mem_blob + stack_size * num_workers);
+  worker_pool_t *me   = (worker_pool_t *) (mem_blob + stack_size * num_workers);
+  worker_info_t *info = (worker_info_t *) (mem_blob + stack_size * num_workers + sizeof(worker_pool_t));
 
   // name for the first worker, useful in debugging threads
   char name[19];
-  snprintf(name, 12, "0x%8x:", (int) me);
-  strcat(name, "worker0");
+  snprintf(name, 12, "%08x:", (int) me);
+  strcat(name, "th0");
   me->num_workers = num_workers;
   // initializations
   for (unsigned int i = 0; i < me->num_workers; i++) {
@@ -216,10 +227,10 @@ AEEResult worker_pool_init_with_stack_size(worker_pool_context_t *context, int s
 
     // set up name
     qurt_thread_attr_set_name(&attr, name);
-    name[17] = (name[17] + 1);
-    // name threads context:worker0, context:worker1, .. (recycle at 9, but num threads should be less than that anyway)
-    if (name[17] > '9') {
-      name[17] = '0';
+    name[11] = (name[11] + 1);
+    // name threads context:th0, context:th1, .. (recycle at 9, but num threads should be less than that anyway)
+    if (name[11] > '9') {
+      name[11] = '0';
     }
     // set up priority - by default, match the creating thread's prio
     int prio = qurt_thread_get_priority(qurt_thread_get_id());
@@ -238,8 +249,12 @@ AEEResult worker_pool_init_with_stack_size(worker_pool_context_t *context, int s
 
     qurt_thread_attr_set_priority(&attr, prio);
 
+    // extra worker info containing worker index
+    info[i].pool         = me;
+    info[i].worker_index = i;
+
     // launch
-    nErr = qurt_thread_create(&(me->thread[i]), &attr, worker_pool_main, (void *) me);
+    nErr = qurt_thread_create(&(me->thread[i]), &attr, worker_pool_main, (void *) &info[i]);
     if (nErr) {
       FARF(ERROR, "Could not launch worker threads!");
       worker_pool_deinit((worker_pool_context_t *) &me);
@@ -306,7 +321,7 @@ AEEResult worker_pool_submit(worker_pool_context_t context, worker_pool_job_t jo
   qurt_thread_t id = qurt_thread_get_id();
   for (i = 0; i < me->num_workers; i++) {
     if (id == me->thread[i]) {
-      job.fptr(job.dptr);  // issue the callback in caller's context
+      job.fptr(job.dptr, i);  // issue the callback in caller's context
       return AEE_SUCCESS;
     }
   }

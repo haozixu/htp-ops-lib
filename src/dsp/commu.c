@@ -379,3 +379,14 @@ bail:
   }
   return err;
 }
+
+void internal_op_tests();
+
+// FastRPC interface
+AEEResult htp_ops_test_ops(remote_handle64 handle) {
+  FARF(ALWAYS, "Op Tests!");
+
+  internal_op_tests();
+
+  return 0;
+}
