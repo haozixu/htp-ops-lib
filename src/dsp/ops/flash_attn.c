@@ -534,8 +534,8 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
         }
       }
 
-      // NOTE: after the use of rowmax(S), store exp(m_i^{j-1} - m_i^j)^{-1} in the very same VTCM buffer
-      HVX_Vector *mvec_inv_exp_m_diff = mvec_s_rowmax;
+      // NOTE: after the use of rowmax(S), store exp(m_i^{j-1} - m_i^j) in the very same VTCM buffer
+      HVX_Vector *mvec_exp_m_diff = mvec_s_rowmax;
 
       // update rowmax vector m_i and vector l_i
       {
@@ -553,21 +553,17 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
           mvec_m[i] = v_m_curr;
           mvec_l[i] = v_l_curr;
 
-          // compute exp(m_i^{j-1} - m_i^j)^{-1} = exp(m_i^j - m_i^{j-1})
-          // HVX_Vector v_neg_m_diff = Q6_V_vxor_VV(v_m_diff, Q6_Vh_vsplat_R(0x8000));  // flip sign bit
-          // mvec_inv_exp_m_diff[i]  = hvx_my_exp2_vhf_vqf16(v_neg_m_diff);             // fp16
-
-          mvec_inv_exp_m_diff[i] = hvx_my_inv_vhf(v_exp_m_diff_hf);  // fp16
+          mvec_exp_m_diff[i] = v_exp_m_diff_hf;  // fp16
         }
       }
 
-      // compute O_i^j = diag(exp(m_i^{j-1} - m_i^j))^{-1} O_i^{j-1} + P_i^j V_j
+      // compute O_i^j = diag(exp(m_i^{j-1} - m_i^j)) O_i^{j-1} + P_i^j V_j
       {
-        // generate D tile = diag(exp(m_i^j - m_i^{j-1}))
+        // generate D tile = diag(exp(m_i^{j-1} - m_i^j))
         const HVX_Vector     v_offsets       = vmem(d_tile_vscatter_offsets);
         const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
         for (int i = 0; i < n_row_tiles; ++i) {
-          const HVX_Vector v_content = Q6_V_vror_VR(mvec_inv_exp_m_diff[i / 2], (i % 2) * 64);
+          const HVX_Vector v_content = Q6_V_vror_VR(mvec_exp_m_diff[i / 2], (i % 2) * 64);
 
           __fp16 *out_base = d_tile + i * (n_tiles_per_blk_r + 1) * HMX_FP16_TILE_N_ELMS;
           Q6_vscatter_QRMVhV(q_32_elems_mask, (size_t) out_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_content);
@@ -795,7 +791,7 @@ int naive_flash_attn(float *restrict O, const float *restrict Q, const __fp16 *r
   const size_t kv_stride = n_kv_heads * head_dim;
 
   // 计算特征缩放因子
-  const float qk_scale = 1.0f / sqrtf(head_dim);
+  const float qk_scale = 1.0f / sqrtf(head_dim) * 1.44269504f;
 
   for (int h = 0; h < n_heads; ++h) {
     const int h_kv = h / gqa_factor;
@@ -891,15 +887,15 @@ int naive_flash_attn(float *restrict O, const float *restrict Q, const __fp16 *r
           float exp_sum = 0.0f;
           float exp_values[Bc];
           for (int c = 0; c < bc; ++c) {
-            exp_values[c] = expf(Sij[r][c] - m_new);
+            exp_values[c] = exp2f(Sij[r][c] - m_new);
             exp_sum += exp_values[c];
           }
 
           // 更新累积因子
-          const float l_prev = li[r] * expf(mi[r] - m_new);
-          const float l_new  = l_prev + exp_sum;
+          const float f = exp2f(mi[r] - m_new);
 
-          const float f = expf(m_new - mi[r]);
+          const float l_new = li[r] * f + exp_sum;
+
           // 更新输出值
           for (int d = 0; d < head_dim; ++d) {
             // 校正历史累积值
