@@ -100,6 +100,24 @@ void find_chunk_size(size_t *blk_r, size_t *blk_c, int gqa_factor, int head_dim,
   *blk_r = nr_ok, *blk_c = nc_ok;
 }
 
+// #define ENABLE_PROFILE_TIMERS
+
+#if defined(ENABLE_PROFILE_TIMERS)
+
+#  define TIMER_DEFINE(name) int64_t name##_ticks = 0
+#  define TIMER_START(name)  int64_t name##_t0 = HAP_perf_get_qtimer_count()
+#  define TIMER_STOP(name)   name##_ticks += HAP_perf_get_qtimer_count() - name##_t0
+#  define TIMER_US(name)     HAP_perf_qtimer_count_to_us(name##_ticks)
+
+#else
+
+#  define TIMER_DEFINE(name)
+#  define TIMER_START(name)
+#  define TIMER_STOP(name)
+#  define TIMER_US(name)
+
+#endif
+
 // pre-assert: D is multiple of 64
 void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
                             const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
@@ -185,6 +203,16 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
     d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
   }
 
+  // profile timers
+  TIMER_DEFINE(q_load);
+  TIMER_DEFINE(k_load);
+  TIMER_DEFINE(v_load);
+  TIMER_DEFINE(qk_dot);
+  TIMER_DEFINE(safe_sm);   // safe softmax
+  TIMER_DEFINE(core_acc);  // core accumulation
+  TIMER_DEFINE(o_scale);
+  TIMER_DEFINE(o_store);
+
   /////////////// CORE LOGIC BEGIN
 
   for (int ir = 0; ir < qo_len; ir += blk_sz_r) {
@@ -194,6 +222,7 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
     const size_t n_row_vec_cnt = ceil_div(n_rows_g, 64);
 
     // load [n_rows*G, D] tile of Q into VTCM
+    TIMER_START(q_load);
     {
       // load block size: G*D elements
       const size_t q_ld_blk_sz_bytes = qo_ldst_blk_sz * qo_element_size;
@@ -256,6 +285,7 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
         // clang-format on
       }
     }
+    TIMER_STOP(q_load);
 
     hvx_fill_uh(mvec_m, 0xfbff, col_vec_size);  // init to -65504 (-inf)
     hvx_fill_uh(mvec_l, 0, col_vec_size);       // init: 0
@@ -274,6 +304,7 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
 
       // load [Bc, D] tile of K^T into VTCM
       // TODO(hzx): use DMA? if DMA used, we should read from VTCM
+      TIMER_START(k_load);
       {
         const __fp16 *k_ld_base = K + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
 
@@ -309,6 +340,7 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
           }
         }
       }
+      TIMER_STOP(k_load);
 
       // issue L2 prefetch of V tile
       {
@@ -317,6 +349,7 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
       }
 
       // compute dot product of tiles: dot(Q[Br', D], K[Bc, D]) ==> [Br', Bc]
+      TIMER_START(qk_dot);
       {
         hmx_unit_acquire();
         {
@@ -334,8 +367,10 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
         }
         hmx_unit_release();
       }
+      TIMER_STOP(qk_dot);
 
       // core softmax computation
+      TIMER_START(safe_sm);
       {
         const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);  // fp16: -65504
 
@@ -484,8 +519,10 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
           mvec_p_rowsum[r_vec_idx] = v_p_rowsum_local;
         }
       }
+      TIMER_STOP(safe_sm);
 
       // load [Bc, D] tile of V into VTCM
+      TIMER_START(v_load);
       {
         // NOTE: at tile granularity, tile V's layout is column-major rather than row-major
         // because V tile is an RHS of matmul and HMX's dot RHS operands are column-major tiles
@@ -522,6 +559,7 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
           // clang-format on
         }
       }
+      TIMER_STOP(v_load);
 
       // issue L2 prefetch of the next K tile
       {
@@ -537,6 +575,7 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
       // NOTE: after the use of rowmax(S), store exp(m_i^{j-1} - m_i^j) in the very same VTCM buffer
       HVX_Vector *mvec_exp_m_diff = mvec_s_rowmax;
 
+      TIMER_START(core_acc);
       // update rowmax vector m_i and vector l_i
       {
         for (int i = 0; i < n_row_vec_cnt; ++i) {  // i => r_vec_idx?
@@ -593,9 +632,11 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
 
         swap_ptr(&o_tile_curr, &o_tile_prev);
       }
+      TIMER_STOP(core_acc);
     }
 
     // generate final output: scale O_i = diag(l_i^{-1}) O_i
+    TIMER_START(o_scale);
     {
       const HVX_Vector     v_offsets       = vmem(d_tile_vscatter_offsets);
       const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
@@ -629,8 +670,10 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
       }
       hmx_unit_release();
     }
+    TIMER_STOP(o_scale);
 
     // store [n_rows*G, D] tile of O back to memory
+    TIMER_START(o_store);
     {
       const size_t o_st_blk_sz_bytes = qo_ldst_blk_sz * qo_element_size;
       const size_t o_st_stride_bytes = qo_ldst_stride * qo_element_size;
@@ -686,7 +729,17 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
         // clang-format on
       }
     }
+    TIMER_STOP(o_store);
   }
+
+#if defined(ENABLE_PROFILE_TIMERS)
+  {
+    FARF(ALWAYS, "q_load: %lld us, k_load: %lld us, v_load: %lld us, qk_dot: %lld us", TIMER_US(q_load),
+         TIMER_US(k_load), TIMER_US(v_load), TIMER_US(qk_dot));
+    FARF(ALWAYS, "safe_sm: %lld us, core_acc: %lld us, o_scale: %lld us, o_store: %lld us", TIMER_US(safe_sm),
+         TIMER_US(core_acc), TIMER_US(o_scale), TIMER_US(o_store));
+  }
+#endif
 }
 
 void simple_flash_attn_worker(void *data, int worker_index) {
