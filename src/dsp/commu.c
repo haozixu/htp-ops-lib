@@ -233,6 +233,8 @@ AEEResult htp_ops_close(remote_handle64 handle) {
   return AEE_SUCCESS;
 }
 
+void init_precomputed_tables();
+
 // FastRPC interface
 AEEResult htp_ops_init_backend(remote_handle64 handle) {
   FARF(ALWAYS, "init_backend called");
@@ -240,6 +242,8 @@ AEEResult htp_ops_init_backend(remote_handle64 handle) {
   power_setup();
   vtcm_manager_setup();
   hmx_manager_setup();
+
+  init_precomputed_tables();
 
   return AEE_SUCCESS;
 }

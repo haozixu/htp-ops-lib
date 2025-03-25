@@ -68,13 +68,14 @@ else()
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/commu.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/power.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/hmx_mgr.c
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/vtcm_mgr.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/worker_pool.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/mmap_mgr.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/op_executor.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/op_tests.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/vtcm_mgr.cc
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/flash_attn.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/mat_mul.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/precompute_table.c
         ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/ops/rms_norm.c
     )
     build_idl(include/htp_ops.idl htp_ops_skel)

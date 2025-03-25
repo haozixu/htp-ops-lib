@@ -131,6 +131,9 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
   const bool   qo_fp32_element = true;  // whether Q/O has fp32 elements
   const size_t qo_element_size = qo_fp32_element ? sizeof(float) : sizeof(__fp16);
 
+  const bool enable_vgather_exp = false;  // use table lookup (vgather) to compute exp, experimental
+
+  // determine block sizes
   size_t blk_sz_r, blk_sz_c;  // Br, Bc
   find_chunk_size(&blk_sz_r, &blk_sz_c, G, head_dim, qo_len, kv_len, vtcm_limit - vtcm);
   assert(blk_sz_c % 64 == 0);
@@ -201,6 +204,12 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
     // offsets within the first tile
     d_tile_vscatter_offsets[i * 2 + 0] = i * 136;
     d_tile_vscatter_offsets[i * 2 + 1] = i * 136 + 6;
+  }
+
+  // alternative computation method
+  void *vtcm_exp2_table = vtcm_manager_query_area("safe_softmax::exp2_hf_qf16");
+  if (!enable_vgather_exp) {
+    (void) vtcm_exp2_table;
   }
 
   // profile timers
@@ -457,14 +466,35 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
             // write permuted rows of P tile into VTCM
             // compute rowsum(P)
             const HVX_Vector v_zero      = Q6_V_vzero();
-            HVX_Vector       v_p_rowsum0 = v_zero;                                            // qf16
-            HVX_Vector       v_p_rowsum1 = v_zero;                                            // qf16
-            for (int c = 0; c < n_cols; c += 64) {
-              HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);  // qf16
-              HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);  // qf16
+            HVX_Vector       v_p_rowsum0 = v_zero;  // qf16
+            HVX_Vector       v_p_rowsum1 = v_zero;  // qf16
 
-              HVX_Vector v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
-              HVX_Vector v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
+            if (enable_vgather_exp) {
+              for (int c = 0; c < n_cols; c += 64) {
+                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);
+                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);
+
+                HVX_Vector v_gather_input0 = Q6_Vh_vasl_VhR(v_s_minus_m0, 1);
+                HVX_Vector v_gather_input1 = Q6_Vh_vasl_VhR(v_s_minus_m1, 1);
+
+                Q6_vgather_ARMVh(&row_buffer0[c / 64], (size_t) vtcm_exp2_table, 65535, v_gather_input0);
+                Q6_vgather_ARMVh(&row_buffer1[c / 64], (size_t) vtcm_exp2_table, 65535, v_gather_input1);
+              }
+            }
+
+            for (int c = 0; c < n_cols; c += 64) {
+              HVX_Vector v_p_row0_hf, v_p_row1_hf;
+
+              if (enable_vgather_exp) {
+                v_p_row0_hf = row_buffer0[c / 64];
+                v_p_row1_hf = row_buffer1[c / 64];
+              } else {
+                HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);  // qf16
+                HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);  // qf16
+
+                v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+                v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
+              }
 
               // handle qk_mask here
               int q_idx0 = ir + (r + 0) / G;

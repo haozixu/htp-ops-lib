@@ -120,7 +120,7 @@ static inline HVX_Vector hvx_my_exp2_vhf(HVX_Vector x_v) {
 }
 
 // adapted from libs/qhl_hvx/src/qhmath_hvx/qhmath_hvx_log2_ahf.c
-HVX_Vector hvx_my_log2_vqf16_vhf(HVX_Vector x_v) {
+static inline HVX_Vector hvx_my_log2_vqf16_vhf(HVX_Vector x_v) {
   const uint16_t sqrt_half_hf = 0x39a8;  // 0.707107 sqrt(2)/2
   const uint16_t log2e_m1_hf  = 0x3715;  // 0.442695 log2(e)-1
 
@@ -230,7 +230,7 @@ HVX_Vector hvx_my_log2_vqf16_vhf(HVX_Vector x_v) {
 }
 
 // adapted from libs/qhl_hvx/src/qhmath_hvx/qhmath_hvx_inv_ahf.c
-HVX_Vector hvx_my_inv_vhf(HVX_Vector x_v) {
+static inline HVX_Vector hvx_my_inv_vhf(HVX_Vector x_v) {
   /*
      * Polynomial coefficients packed in specific format (adding zeros on some places)
      * in order to easier manipulate with them later using VLUT instructions
