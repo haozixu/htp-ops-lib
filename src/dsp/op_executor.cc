@@ -163,29 +163,32 @@ int execute_op_simple(struct OpComputeRequest *req) {
         add_buffer(in_bufs, params->v, kv_size);
         add_buffer(in_bufs, params->mask, mask_size);
 
-        /*
-        float *ref_out;
-        posix_memalign((void **) &ref_out, 128, qo_size);
+        constexpr bool check_accuracy = false;
 
-        validate_in_bufs();
-        ret = simple_flash_attn((__fp16 *) ref_out, (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                                (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+        if (check_accuracy) {
+          float *ref_out;
+          posix_memalign((void **) &ref_out, 128, qo_size);
 
-        // check logic
-        naive_flash_attn((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                         (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
-        
-        op_utils::compare_result((float *) OUT_PTR(0), ref_out, qo_size / 4);
+          validate_in_bufs();
+          ret = simple_flash_attn((__fp16 *) ref_out, (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
+                                  (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
 
-        validate_out_bufs();
+          // check logic
+          naive_flash_attn((float *) OUT_PTR(0), (float *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
+                           (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
 
-        free(ref_out);
-        */
+          op_utils::compare_result((float *) OUT_PTR(0), ref_out, qo_size / 4);
 
-        validate_in_bufs();
-        ret = simple_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
-                                (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
-        validate_out_bufs();
+          validate_out_bufs();
+
+          free(ref_out);
+        } else {
+          validate_in_bufs();
+          ret =
+            simple_flash_attn((__fp16 *) OUT_PTR(0), (__fp16 *) IN_PTR(0), (__fp16 *) IN_PTR(1), (__fp16 *) IN_PTR(2),
+                              (__fp16 *) IN_PTR(3), qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+          validate_out_bufs();
+        }
       }
       break;
 

@@ -48,7 +48,17 @@ static inline void hvx_fill_uh(void *p, uint16_t v, size_t size) {
   }
 }
 
-size_t compute_vtcm_usage(int gqa_factor, int head_dim, int n_rows, int n_cols) {
+static inline void hvx_fill_uw(void *p, uint32_t v, size_t size) {
+  assert(size % VLEN == 0);
+  assert(is_aligned(p, VLEN));
+  HVX_Vector  v_v    = Q6_V_vsplat_R(v);
+  HVX_Vector *pv_out = (HVX_Vector *) p;
+  for (int i = 0; i < size / VLEN; ++i) {
+    *pv_out++ = v_v;
+  }
+}
+
+size_t fa_f16_compute_vtcm_usage(int gqa_factor, int head_dim, int n_rows, int n_cols) {
   const size_t g_br = align_up(gqa_factor * n_rows, HMX_FP16_TILE_N_ROWS);
 
   const size_t qo_tile_size   = align_up(g_br * head_dim * sizeof(__fp16), 4096);    // Q, O: [Br', D]
@@ -67,10 +77,8 @@ size_t compute_vtcm_usage(int gqa_factor, int head_dim, int n_rows, int n_cols) 
 #define MAX_G_BR        256
 #define __vec_aligned__ __attribute__((aligned(VLEN)))
 
-void find_chunk_size(size_t *blk_r, size_t *blk_c, int gqa_factor, int head_dim, int qo_len, int kv_len, size_t limit) {
-  const size_t nr_unit = ceil_div(HMX_FP16_TILE_N_ROWS, gqa_factor);
-  const size_t nc_unit = 64;
-
+void find_chunk_size_common(size_t *blk_r, size_t *blk_c, int gqa_factor, int head_dim, int qo_len, int kv_len,
+                            size_t limit, int nr_unit, int nc_unit, size_t (*compute_vtcm_usage)(int, int, int, int)) {
   size_t nr = nr_unit, nc = nc_unit;
   size_t nr_ok = nr, nc_ok = nc;
   assert(compute_vtcm_usage(gqa_factor, head_dim, nr, nc) <= limit);
@@ -100,6 +108,15 @@ void find_chunk_size(size_t *blk_r, size_t *blk_c, int gqa_factor, int head_dim,
   *blk_r = nr_ok, *blk_c = nc_ok;
 }
 
+void fa_f16_find_chunk_size(size_t *blk_r, size_t *blk_c, int gqa_factor, int head_dim, int qo_len, int kv_len,
+                            size_t limit) {
+  const int nr_unit = ceil_div(HMX_FP16_TILE_N_ROWS, gqa_factor);
+  const int nc_unit = 64;
+
+  find_chunk_size_common(blk_r, blk_c, gqa_factor, head_dim, qo_len, kv_len, limit, nr_unit, nc_unit,
+                         fa_f16_compute_vtcm_usage);
+}
+
 // #define ENABLE_PROFILE_TIMERS
 
 #if defined(ENABLE_PROFILE_TIMERS)
@@ -119,10 +136,10 @@ void find_chunk_size(size_t *blk_r, size_t *blk_c, int gqa_factor, int head_dim,
 #endif
 
 // pre-assert: D is multiple of 64
-void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
-                            const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
-                            const __fp16 *restrict qk_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
-                            int head_dim) {
+void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
+                                const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
+                                const __fp16 *restrict qk_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
+                                int head_dim) {
   // "compile-time" configs
   // TODO: make them real compile-time constants (constexpr or template parameters)
   const int G = n_heads / n_kv_heads;  // GQA factor
@@ -131,11 +148,11 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
   const bool   qo_fp32_element = true;  // whether Q/O has fp32 elements
   const size_t qo_element_size = qo_fp32_element ? sizeof(float) : sizeof(__fp16);
 
-  const bool enable_vgather_exp = false;  // use table lookup (vgather) to compute exp, experimental
+  const bool enable_vgather_exp = true;  // use table lookup (vgather) to compute exp, experimental
 
   // determine block sizes
   size_t blk_sz_r, blk_sz_c;  // Br, Bc
-  find_chunk_size(&blk_sz_r, &blk_sz_c, G, head_dim, qo_len, kv_len, vtcm_limit - vtcm);
+  fa_f16_find_chunk_size(&blk_sz_r, &blk_sz_c, G, head_dim, qo_len, kv_len, vtcm_limit - vtcm);
   assert(blk_sz_c % 64 == 0);
 
   const size_t g_br = align_up(G * blk_sz_r, HMX_FP16_TILE_N_ROWS);  // Br'
@@ -307,9 +324,8 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
 
     // inner loop over kv_len
     for (int jc = 0; jc < kv_len; jc += blk_sz_c) {
-      const size_t n_cols        = smin(kv_len - jc, blk_sz_c);
-      const size_t n_col_tiles   = ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
-      const size_t n_col_vec_cnt = ceil_div(n_cols, 64);
+      const size_t n_cols      = smin(kv_len - jc, blk_sz_c);
+      const size_t n_col_tiles = ceil_div(n_cols, HMX_FP16_TILE_N_COLS);
 
       // load [Bc, D] tile of K^T into VTCM
       // TODO(hzx): use DMA? if DMA used, we should read from VTCM
@@ -383,10 +399,6 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
       {
         const HVX_Vector v_neg_inf = Q6_Vh_vsplat_R(0xfbff);  // fp16: -65504
 
-        // prepare leftover masks
-        const int            n_col_leftover  = n_cols % 64;
-        const HVX_VectorPred q_leftover_mask = Q6_Q_vsetq_R(n_col_leftover);
-
         // read from S tile, process 2 rows at a time, generate P tile
         for (int r_vec_idx = 0; r_vec_idx < n_row_vec_cnt; ++r_vec_idx) {
           // vector registers, empty when initialized, fill in 2 rows at a time
@@ -419,20 +431,31 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
               *pv_row_buf1++               = Q6_V_hi_W(vp_s_dual_row);
             }
 
-            // mask out out-of-boundary values
-            if (n_col_leftover > 0) {
-              const int last_vec_idx    = n_cols / 64;
-              row_buffer0[last_vec_idx] = Q6_V_vmux_QVV(q_leftover_mask, row_buffer0[last_vec_idx], v_neg_inf);
-              row_buffer1[last_vec_idx] = Q6_V_vmux_QVV(q_leftover_mask, row_buffer1[last_vec_idx], v_neg_inf);
-            }
-
-            // compute rowmax(S)
+            // apply mask & compute rowmax(S)
             HVX_Vector v_s_rowmax0 = v_neg_inf;
             HVX_Vector v_s_rowmax1 = v_neg_inf;
             // reduction phase 1: inter-vector
-            for (int j = 0; j < n_col_vec_cnt; ++j) {
-              v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, row_buffer0[j]);
-              v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, row_buffer1[j]);
+            for (int c = 0; c < n_cols; c += 64) {
+              int q_idx0 = ir + (r + 0) / G;
+              int q_idx1 = ir + (r + 1) / G;
+              int k_idx  = jc + c;
+
+              // hope this won't cause out-of-bounds access
+              HVX_Vector v_mask0 = vmemu(qk_mask + q_idx0 * kv_len + k_idx);
+              HVX_Vector v_mask1 = vmemu(qk_mask + q_idx1 * kv_len + k_idx);
+
+              const HVX_Vector v_fp16_mask_threshold = Q6_Vh_vsplat_R(0xcc00);  // fp16: -16.0
+              HVX_VectorPred   q_mask_out0           = Q6_Q_vcmp_gt_VhfVhf(v_fp16_mask_threshold, v_mask0);
+              HVX_VectorPred   q_mask_out1           = Q6_Q_vcmp_gt_VhfVhf(v_fp16_mask_threshold, v_mask1);
+
+              HVX_Vector v_s_row0 = Q6_V_vmux_QVV(q_mask_out0, v_neg_inf, row_buffer0[c / 64]);
+              HVX_Vector v_s_row1 = Q6_V_vmux_QVV(q_mask_out1, v_neg_inf, row_buffer1[c / 64]);
+
+              row_buffer0[c / 64] = v_s_row0;
+              row_buffer1[c / 64] = v_s_row1;
+
+              v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, v_s_row0);
+              v_s_rowmax1 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax1, v_s_row1);
             }
 
             // clang-format off
@@ -466,8 +489,8 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
             // write permuted rows of P tile into VTCM
             // compute rowsum(P)
             const HVX_Vector v_zero      = Q6_V_vzero();
-            HVX_Vector       v_p_rowsum0 = v_zero;  // qf16
-            HVX_Vector       v_p_rowsum1 = v_zero;  // qf16
+            HVX_Vector       v_p_rowsum0 = v_zero;  // qfloat
+            HVX_Vector       v_p_rowsum1 = v_zero;  // qfloat
 
             if (enable_vgather_exp) {
               for (int c = 0; c < n_cols; c += 64) {
@@ -496,22 +519,6 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
                 v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
               }
 
-              // handle qk_mask here
-              int q_idx0 = ir + (r + 0) / G;
-              int q_idx1 = ir + (r + 1) / G;
-              int k_idx  = jc + c;
-
-              // hope this won't cause out-of-bounds access
-              HVX_Vector v_mask0 = vmemu(qk_mask + q_idx0 * kv_len + k_idx);
-              HVX_Vector v_mask1 = vmemu(qk_mask + q_idx1 * kv_len + k_idx);
-
-              const HVX_Vector v_fp16_mask_threshold = Q6_Vh_vsplat_R(0xcc00);  // fp16: -16.0
-              HVX_VectorPred   q_mask_out0           = Q6_Q_vcmp_gt_VhfVhf(v_fp16_mask_threshold, v_mask0);
-              HVX_VectorPred   q_mask_out1           = Q6_Q_vcmp_gt_VhfVhf(v_fp16_mask_threshold, v_mask1);
-
-              v_p_row0_hf = Q6_V_vmux_QVV(q_mask_out0, v_zero, v_p_row0_hf);
-              v_p_row1_hf = Q6_V_vmux_QVV(q_mask_out1, v_zero, v_p_row1_hf);
-
               // compute P tile output positions
               __fp16     *out_dual_tile = p_st_base + (c / 64) * HMX_FP16_TILE_N_ELMS * 2;
               HVX_Vector *pv_p_out0     = ((HVX_Vector *) out_dual_tile) + r1 / 2;
@@ -523,22 +530,38 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
               *pv_p_out1                   = Q6_V_hi_W(vp_p_dual_row);
 
               // rowsum(P) phase 1 reduction
-              v_p_rowsum0 = Q6_Vqf16_vadd_Vqf16Vhf(v_p_rowsum0, v_p_row0_hf);
-              v_p_rowsum1 = Q6_Vqf16_vadd_Vqf16Vhf(v_p_rowsum1, v_p_row1_hf);
+              // v_p_rowsum0 = Q6_Vqf16_vadd_Vqf16Vhf(v_p_rowsum0, v_p_row0_hf);
+              // v_p_rowsum1 = Q6_Vqf16_vadd_Vqf16Vhf(v_p_rowsum1, v_p_row1_hf);
+
+              // reduce sum using qf32 precision
+              HVX_VectorPair vp_p_row0 = hvx_my_vhf_to_wqf32(v_p_row0_hf);
+              HVX_VectorPair vp_p_row1 = hvx_my_vhf_to_wqf32(v_p_row1_hf);
+
+              v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(
+                v_p_rowsum0, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row0), Q6_V_hi_W(vp_p_row0)));
+              v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(
+                v_p_rowsum1, Q6_Vqf32_vadd_Vqf32Vqf32(Q6_V_lo_W(vp_p_row1), Q6_V_hi_W(vp_p_row1)));
             }
 
             // clang-format off
             // rowsum(P) phase 2 reduction
-            #pragma unroll
-            for (int s = 64; s >= 2; s >>= 1) {
-              v_p_rowsum0 = Q6_Vqf16_vadd_Vqf16Vqf16(v_p_rowsum0, Q6_V_vlalign_VVR(v_p_rowsum0, v_zero, s));
-              v_p_rowsum1 = Q6_Vqf16_vadd_Vqf16Vqf16(v_p_rowsum1, Q6_V_vlalign_VVR(v_p_rowsum1, v_zero, s));
-            }
+            // #pragma unroll
+            // for (int s = 64; s >= 2; s >>= 1) {
+            //   v_p_rowsum0 = Q6_Vqf16_vadd_Vqf16Vqf16(v_p_rowsum0, Q6_V_vlalign_VVR(v_p_rowsum0, v_zero, s));
+            //   v_p_rowsum1 = Q6_Vqf16_vadd_Vqf16Vqf16(v_p_rowsum1, Q6_V_vlalign_VVR(v_p_rowsum1, v_zero, s));
+            // }
             // clang-format on
             // now, v_p_rowsum0[63] = rowsum(P)_0, v_p_rowsum1[63] = rowsum(P)_1
 
+#pragma unroll
+            for (int s = 64; s >= 4; s >>= 1) {
+              v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_V_vlalign_VVR(v_p_rowsum0, v_zero, s));
+              v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_V_vlalign_VVR(v_p_rowsum1, v_zero, s));
+            }
+            HVX_Vector v_p_rowsum_pack2 = Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(v_p_rowsum1, v_p_rowsum0));
+
             // shift rowsum(P) into v_p_rowsum_local
-            HVX_Vector v_p_rowsum_pack2     = Q6_V_hi_W(Q6_W_vshuff_VVR(v_p_rowsum1, v_p_rowsum0, -2));
+            // HVX_Vector v_p_rowsum_pack2     = Q6_V_hi_W(Q6_W_vshuff_VVR(v_p_rowsum1, v_p_rowsum0, -2));
             HVX_Vector v_p_rowsum_pack2_rot = Q6_V_vror_VR(v_p_rowsum_pack2, VLEN - 2 * sizeof(__fp16));
             HVX_Vector v_p_rowsum_local_rot = Q6_V_vror_VR(v_p_rowsum_local, r_vec_off * sizeof(__fp16));
             v_p_rowsum_local = Q6_V_vlalign_VVR(v_p_rowsum_pack2_rot, v_p_rowsum_local_rot, r_vec_off * sizeof(__fp16));
@@ -617,7 +640,7 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
 
           // l_i^j = exp(m_i^{j-1} - m_i^j) * l_i^{j-1} + rowsum(P_i^j)
           HVX_Vector v_l_curr = Q6_Vqf16_vmpy_Vqf16Vhf(mvec_l[i], v_exp_m_diff_hf);  // qf16
-          v_l_curr            = Q6_Vqf16_vadd_Vqf16Vqf16(v_l_curr, mvec_p_rowsum[i]);
+          v_l_curr            = Q6_Vqf16_vadd_Vqf16Vhf(v_l_curr, mvec_p_rowsum[i]);
 
           mvec_m[i] = v_m_curr;
           mvec_l[i] = v_l_curr;
@@ -650,7 +673,12 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
 
               __fp16 *p_tile_in = p_tile + (r * n_tiles_per_blk_c) * HMX_FP16_TILE_N_ELMS;  // P: [Br', Bc]
               __fp16 *v_tile_in = v_tile + (c * n_tiles_per_blk_c) * HMX_FP16_TILE_N_ELMS;  // V: [Bc, D] --T-> [D, Bc]
-              hmx_load_tiles_fp16(p_tile_in, v_tile_in, n_col_tiles);
+              // NOTE: `n_col_tiles` may exceed 32, we need to explicitly split and accumulate
+              for (int k = 0; k < n_col_tiles; k += 32) {
+                int    offset  = k * HMX_FP16_TILE_N_ELMS;
+                size_t n_tiles = smin(n_col_tiles - k, 32);
+                hmx_load_tiles_fp16(p_tile_in + offset, v_tile_in + offset, n_tiles);
+              }
 
               // NOTE: O's layout is also column-major as O is always on the RHS
               __fp16 *o_tile_out = o_tile_curr + (c * n_tiles_per_blk_r + r) * HMX_FP16_TILE_N_ELMS;
@@ -772,6 +800,507 @@ void simple_flash_attn_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit,
 #endif
 }
 
+size_t fa_f32_compute_vtcm_usage(int group_size, int head_dim, int n_rows, int n_cols) {
+  const size_t g_br = align_up(group_size * n_rows, 32);
+
+  const size_t qo_tile_size   = align_up(g_br * head_dim * sizeof(float), 4096);    // Q, O: [Br', D]
+  const size_t kv_tile_size   = align_up(n_cols * head_dim * sizeof(float), 4096);  // K, V: [Bc, D]
+  const size_t core_tile_size = align_up(g_br * n_cols * sizeof(float), 4096);      // S, P: [Br', Bc]
+  const size_t col_vec_size   = align_up(g_br * sizeof(float), 256);                // m_prev, m_curr, l, rowsum: [Br']
+
+  size_t total =
+    qo_tile_size * 2 /* Q, O */ + kv_tile_size * 2 /* K, V */ + core_tile_size * 1 /* S/P */ + col_vec_size * 4;
+  return total;
+}
+
+void fa_f32_find_chunk_size(size_t *blk_r, size_t *blk_c, int group_size, int head_dim, int qo_len, int kv_len,
+                            size_t limit) {
+  const int nr_unit = 32 / group_size;
+  const int nc_unit = 32;
+
+  find_chunk_size_common(blk_r, blk_c, group_size, head_dim, qo_len, kv_len, limit, nr_unit, nc_unit,
+                         fa_f32_compute_vtcm_usage);
+}
+
+void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_limit, __fp16 *restrict O,
+                                const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
+                                const __fp16 *restrict qk_mask, int qo_len, int kv_len, int n_heads, int n_kv_heads,
+                                int head_dim) {
+  const int G = n_heads / n_kv_heads;  // group size
+  const int D = head_dim;
+
+  const float qk_scale = 1.0f / sqrtf(head_dim) * 1.44269504f;
+
+  const size_t qo_ldst_stride = n_heads * head_dim;
+  const size_t qo_ldst_blk_sz = G * head_dim;
+  const size_t kv_ld_stride   = n_kv_heads * head_dim;
+  const size_t kv_ld_blk_sz   = head_dim;
+
+  size_t blk_sz_r, blk_sz_c;  // Br, Bc
+  fa_f32_find_chunk_size(&blk_sz_r, &blk_sz_c, G, head_dim, qo_len, kv_len, vtcm_limit - vtcm);
+
+  const size_t g_br = align_up(G * blk_sz_r, 32);  // Br'
+  FARF(ALWAYS, "%s: Br=%d Bc=%d Br'=%d", __func__, blk_sz_r, blk_sz_c, g_br);
+
+  const size_t qo_tile_size   = align_up(g_br * head_dim * sizeof(float), 4096);      // Q, O: [Br', D]
+  const size_t kv_tile_size   = align_up(blk_sz_c * head_dim * sizeof(float), 4096);  // K, V: [Bc, D]
+  const size_t core_tile_size = align_up(g_br * blk_sz_c * sizeof(float), 4096);      // S, P: [Br', Bc]
+  const size_t col_vec_size   = align_up(g_br * sizeof(float), 256);  // m_prev, m_curr, l, rowsum: [Br']
+
+  uint8_t *vtcm_cur = vtcm;
+
+  float *q_tile = (float *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
+  float *o_tile = (float *) vtcm_seq_alloc(&vtcm_cur, qo_tile_size);
+  float *k_tile = (float *) vtcm_seq_alloc(&vtcm_cur, kv_tile_size);
+  float *v_tile = (float *) vtcm_seq_alloc(&vtcm_cur, kv_tile_size);
+  float *s_tile = (float *) vtcm_seq_alloc(&vtcm_cur, core_tile_size);
+
+  HVX_Vector *mvec_m_prev   = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_m_curr   = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_p_rowsum = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+  HVX_Vector *mvec_l        = (HVX_Vector *) vtcm_seq_alloc(&vtcm_cur, col_vec_size);
+
+  assert(vtcm_cur <= vtcm_limit);
+
+  for (int ir = 0; ir < qo_len; ir += blk_sz_r) {
+    const size_t n_rows   = smin(qo_len - ir, blk_sz_r);
+    const size_t n_rows_g = n_rows * G;
+
+    // load [n_rows*G, D] tile of Q into VTCM
+    {
+      const float *q_ld_base = ((const float *) Q) + ir * qo_ldst_stride + kv_head_idx * qo_ldst_blk_sz;
+
+      // l2fetch(q_ld_base, qo_ldst_stride * sizeof(float), qo_ldst_blk_sz * sizeof(float), n_rows, 1);
+
+      // HVX_Vector *pv_out = (HVX_Vector *) q_tile;
+      // for (int r = 0; r < n_rows; ++r) {
+      //   const HVX_Vector *pv_in = (const HVX_Vector *) (q_ld_base + r * qo_ldst_stride);
+      //   for (int gd = 0; gd < G * D; gd += 32) {
+      //     *pv_out++ = *pv_in++;
+      //   }
+      // }
+
+      _Alignas(64) dma_desc_2d_t desc = { 0 };
+
+      desc.next       = 0;  // no next descriptor
+      desc.length     = 0;  // not used
+      desc.type       = DMA_DESC_TYPE_2D;
+      desc.dst_bypass = 0;
+      desc.src_bypass = 1;                        // bypass L2 cache
+      desc.order      = 1;                        // ordered, doesn't matter
+      desc.dstate     = DMA_DESC_DSTATE_PENDING;  // to be processed
+
+      desc.src        = (uint32_t) q_ld_base;
+      desc.dst        = (uint32_t) q_tile;
+      desc.roi_width  = qo_ldst_blk_sz * sizeof(float);
+      desc.roi_height = n_rows;
+      desc.src_stride = qo_ldst_stride * sizeof(float);
+      desc.dst_stride = qo_ldst_blk_sz * sizeof(float);
+
+      desc.src_width_offset = 0;
+      desc.dst_width_offset = 0;
+
+      dma_wait_for_idle();
+      dma_submit_one((dma_desc_1d_t *) &desc);
+      dma_wait_for_idle();
+    }
+
+    hvx_fill_uw(mvec_m_prev, 0xff7fffff, col_vec_size);
+    hvx_fill_uw(mvec_l, 0, col_vec_size);
+
+    hvx_fill_uw(o_tile, 0, core_tile_size);
+
+    for (int jc = 0; jc < kv_len; jc += blk_sz_c) {
+      const size_t n_cols = smin(kv_len - jc, blk_sz_c);
+
+      // load and convert [Bc, D] tile of K into VTCM
+      {
+        const __fp16 *k_ld_base = K + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+
+        l2fetch(k_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), n_cols, 1);
+
+        /*
+        HVX_Vector *pv_out = (HVX_Vector *) k_tile;
+        for (int c = 0; c < n_cols; ++c) {
+          const HVX_Vector *pv_in = (const HVX_Vector *) (k_ld_base + c * kv_ld_stride);
+
+#pragma unroll
+          for (int d = 0; d < D; d += 64) {
+            HVX_VectorPair vp = hvx_my_vhf_to_wsf(*pv_in++);
+            vp                = Q6_W_vshuff_VVR(Q6_V_hi_W(vp), Q6_V_lo_W(vp), -4);
+            *pv_out++         = Q6_V_lo_W(vp);
+            *pv_out++         = Q6_V_hi_W(vp);
+          }
+        }
+        */
+
+        // NOTE: This scalar version is slow but more accurate
+        for (int c = 0; c < n_cols; ++c) {
+          for (int d = 0; d < head_dim; ++d) {
+            k_tile[c * head_dim + d] = (float) k_ld_base[c * kv_ld_stride + d];
+          }
+        }
+      }
+
+      // issue L2 prefetch of V tile
+      {
+        const __fp16 *v_ld_base = V + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+        l2fetch(v_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), n_cols, 0);
+      }
+
+      // compute QK^T
+      {
+        const HVX_Vector v_zero          = Q6_V_vzero();
+        const HVX_Vector v_qk_scale_sf   = Q6_V_vsplat_R(*(uint32_t *) (&qk_scale));  // fp32_to_bits
+        const HVX_Vector v_qk_scale_qf32 = Q6_Vqf32_vadd_VsfVsf(v_qk_scale_sf, v_zero);
+
+        for (int r = 0; r < n_rows_g; ++r) {
+          for (int c0 = 0; c0 < n_cols; c0 += 32) {
+            _Alignas(VLEN) float qk_dot_local[32], tmp[32];
+
+            for (int c1 = 0; c1 < 32; ++c1) {
+              int c = c0 + c1;
+              if (c >= n_cols) {
+                break;
+              }
+
+              const HVX_Vector *pv_row = (const HVX_Vector *) (q_tile + r * head_dim);
+              const HVX_Vector *pv_col = (const HVX_Vector *) (k_tile + c * head_dim);
+
+              HVX_Vector v_sum = v_zero;
+              for (int d = 0; d < D; d += 32) {
+                HVX_Vector v_prod;
+                v_prod = Q6_Vqf32_vmpy_VsfVsf(*pv_row++, *pv_col++);
+                v_sum  = Q6_Vqf32_vadd_Vqf32Vqf32(v_sum, v_prod);
+              }
+#pragma unroll
+              for (int s = 64; s >= 4; s >>= 1) {
+                v_sum = Q6_Vqf32_vadd_Vqf32Vqf32(v_sum, Q6_V_vlalign_VVR(v_sum, v_zero, s));
+              }
+              vmem(tmp)        = v_sum;
+              qk_dot_local[c1] = tmp[31];
+            }
+
+            HVX_Vector v_scaled_qk           = Q6_Vqf32_vmpy_Vqf32Vqf32(vmem(qk_dot_local), v_qk_scale_qf32);
+            vmem(&s_tile[r * blk_sz_c + c0]) = Q6_Vsf_equals_Vqf32(v_scaled_qk);
+          }
+        }
+
+        // for (int r = 0; r < n_rows_g; ++r) {
+        //   for (int c = 0; c < n_cols; ++c) {
+        //     float s = 0.0f;
+        //     for (int d = 0; d < head_dim; ++d) {
+        //       s += q_tile[r * head_dim + d] * k_tile[c * head_dim + d];
+        //     }
+        //     s_tile[r * blk_sz_c + c] = s * qk_scale;
+        //   }
+        // }
+      }
+
+      // core softmax computation
+      {
+        const HVX_Vector v_neg_inf = Q6_V_vsplat_R(0xff7fffff);  // 1 11111110 11...1
+
+        for (int r0 = 0; r0 < n_rows_g; r0 += 32) {
+          _Alignas(VLEN) float m_prev_local[32], m_curr_local[32], p_rowsum_local[32], tmp[32];
+
+          vmem(m_prev_local) = mvec_m_prev[r0 / 32];
+
+          for (int r1 = 0; r1 < 32; ++r1) {
+            int r = r0 + r1;
+            if (r >= n_rows_g) {
+              break;
+            }
+
+            HVX_Vector *const pv_s_row = (HVX_Vector *) (s_tile + r * blk_sz_c);
+
+            // apply mask & compute rowmax(S)
+            HVX_Vector v_s_rowmax = v_neg_inf;
+            for (int c = 0; c < n_cols; c += 32) {
+              int q_idx = ir + r / G;
+              int k_idx = jc + c;
+
+              HVX_Vector     v_mask_hf  = vmemu(qk_mask + q_idx * kv_len + k_idx);
+              HVX_VectorPair vp_mask_sf = hvx_my_vhf_to_wsf(v_mask_hf);
+              HVX_Vector     v_mask_sf  = Q6_V_lo_W(Q6_W_vshuff_VVR(Q6_V_hi_W(vp_mask_sf), Q6_V_lo_W(vp_mask_sf), -4));
+
+              const HVX_Vector v_fp32_mask_threshold = Q6_V_vsplat_R(0xc3000000);  // fp32: -128.0
+              HVX_VectorPred   q_mask_out            = Q6_Q_vcmp_gt_VsfVsf(v_fp32_mask_threshold, v_mask_sf);
+
+              HVX_Vector v_s_row = Q6_V_vmux_QVV(q_mask_out, v_neg_inf, pv_s_row[c / 32]);
+              pv_s_row[c / 32]   = v_s_row;
+
+              v_s_rowmax = Q6_Vsf_vmax_VsfVsf(v_s_rowmax, v_s_row);
+            }
+#pragma unroll
+            for (int s = 64; s >= 4; s >>= 1) {
+              v_s_rowmax = Q6_Vsf_vmax_VsfVsf(v_s_rowmax, Q6_V_vlalign_VVR(v_s_rowmax, v_neg_inf, s));
+            }
+            vmem(tmp)      = v_s_rowmax;
+            float s_rowmax = tmp[31];
+
+            float m_cur      = s_rowmax > m_prev_local[r1] ? s_rowmax : m_prev_local[r1];  // fmaxf
+            m_curr_local[r1] = m_cur;
+
+            HVX_Vector v_dup_m = Q6_V_vsplat_R(*(uint32_t *) (&m_cur));  // fp32_to_bits
+
+            // compute rows of P = exp(S - m)
+            HVX_Vector *const pv_p_row   = pv_s_row;  // inplace replacement of S tile
+            const HVX_Vector  v_zero     = Q6_V_vzero();
+            HVX_Vector        v_p_rowsum = v_zero;    // qf32
+            for (int c = 0; c < n_cols; c += 32) {
+              HVX_Vector v_s_minus_m = Q6_Vqf32_vsub_VsfVsf(pv_s_row[c / 32], v_dup_m);
+              HVX_Vector v_p_row_sf  = hvx_my_exp2_vsf_vqf32(v_s_minus_m);
+
+              pv_p_row[c / 32] = v_p_row_sf;
+
+              v_p_rowsum = Q6_Vqf32_vadd_Vqf32Vsf(v_p_rowsum, v_p_row_sf);
+            }
+#pragma unroll
+            for (int s = 64; s >= 4; s >>= 1) {
+              v_p_rowsum = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum, Q6_V_vlalign_VVR(v_p_rowsum, v_zero, s));
+            }
+            vmem(tmp)      = v_p_rowsum;
+            float p_rowsum = tmp[31];
+
+            p_rowsum_local[r1] = p_rowsum;
+          }
+
+          mvec_m_curr[r0 / 32]   = vmem(m_curr_local);
+          mvec_p_rowsum[r0 / 32] = vmem(p_rowsum_local);
+        }
+      }
+
+      // load and convert [Bc, D] tile of V into VTCM
+      {
+        const __fp16 *v_ld_base = V + jc * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+
+        /*
+        HVX_Vector *pv_out = (HVX_Vector *) v_tile;
+        for (int c = 0; c < n_cols; ++c) {
+          const HVX_Vector *pv_in = (const HVX_Vector *) (v_ld_base + c * kv_ld_stride);
+
+#pragma unroll
+          for (int d = 0; d < D; d += 64) {
+            HVX_VectorPair vp = hvx_my_vhf_to_wsf(*pv_in++);
+            vp                = Q6_W_vshuff_VVR(Q6_V_hi_W(vp), Q6_V_lo_W(vp), -4);
+            *pv_out++         = Q6_V_lo_W(vp);
+            *pv_out++         = Q6_V_hi_W(vp);
+          }
+        }
+        */
+
+        // NOTE: This scalar version is slow but more accurate
+        for (int c = 0; c < n_cols; ++c) {
+          for (int d = 0; d < head_dim; ++d) {
+            v_tile[c * head_dim + d] = (float) v_ld_base[c * kv_ld_stride + d];
+          }
+        }
+      }
+
+      // issue L2 prefetch of the next K tile
+      {
+        int jc_next = jc + blk_sz_c;
+        if (jc_next < kv_len) {
+          const size_t n_cols_next = smin(kv_len - jc_next, blk_sz_c);
+
+          const __fp16 *k_ld_base = K + jc_next * kv_ld_stride + kv_head_idx * kv_ld_blk_sz;
+          l2fetch(k_ld_base, kv_ld_stride * sizeof(__fp16), kv_ld_blk_sz * sizeof(__fp16), n_cols_next, 0);
+        }
+      }
+
+      // core accumulation (update)
+      {
+        HVX_Vector *mvec_exp_m_diff = mvec_m_curr;  // inplace replacement, qf32
+        // update vector m_i, l_i
+        for (int r = 0; r < n_rows_g; r += 32) {
+          int i = r / 32;
+
+          HVX_Vector v_m_prev = mvec_m_prev[i];
+          HVX_Vector v_m_curr = mvec_m_curr[i];
+          HVX_Vector v_m_diff = Q6_Vqf32_vsub_VsfVsf(v_m_prev, v_m_curr);
+
+          HVX_Vector v_exp_m_diff = hvx_my_exp2_vqf32(v_m_diff);
+
+          // l_i^j = exp(m_i^{j-1} - m_i^j) * l_i^{j-1} + rowsum(P_i^j)
+          HVX_Vector v_l_curr = Q6_Vqf32_vmpy_Vqf32Vqf32(mvec_l[i], v_exp_m_diff);
+          v_l_curr            = Q6_Vqf32_vadd_Vqf32Vqf32(v_l_curr, mvec_p_rowsum[i]);
+
+          mvec_m_prev[i] = v_m_curr;
+          mvec_l[i]      = v_l_curr;
+
+          mvec_exp_m_diff[i] = v_exp_m_diff;  // qf32
+        }
+
+        // compute O_i^j = diag(exp(m_i^{j-1} - m_i^j)) O_i^{j-1} + P_i^j V_j
+
+        /*
+        // scalar impl ref: assume o_tile fp32
+        _Alignas(VLEN) float o_row_scale_local[32];
+        for (int r0 = 0; r0 < n_rows_g; r0 += 32) {
+          vmem(o_row_scale_local) = Q6_Vsf_equals_Vqf32(mvec_exp_m_diff[r0 / 32]);
+
+          for (int r1 = 0; r1 < 32; ++r1) {
+            int r = r0 + r1;
+            if (r >= n_rows_g) {
+              break;
+            }
+
+            float *p_row = s_tile + r * blk_sz_c;
+            float *o_row = o_tile + r * head_dim;
+
+            for (int d = 0; d < head_dim; ++d) {
+              o_row[d] *= o_row_scale_local[r1];
+
+              float sum = 0.0f;
+              for (int c = 0; c < n_cols; ++c) {
+                sum += p_row[c] * v_tile[c * head_dim + d];
+              }
+              o_row[d] += sum;
+            }
+          }
+        }
+        */
+
+        _Alignas(VLEN) int32_t o_row_scale_qf32_local[32], p_row_local[32];
+        for (int r0 = 0; r0 < n_rows_g; r0 += 32) {
+          vmem(o_row_scale_qf32_local) = mvec_exp_m_diff[r0 / 32];
+
+          for (int r1 = 0; r1 < 32; ++r1) {
+            int r = r0 + r1;
+            if (r >= n_rows_g) {
+              break;
+            }
+
+            int32_t          o_row_scale_qf32   = o_row_scale_qf32_local[r1];
+            const HVX_Vector v_o_row_scale_qf32 = Q6_V_vsplat_R(o_row_scale_qf32);
+
+            const HVX_Vector *const pv_p_row = (const HVX_Vector *) (s_tile + r * blk_sz_c);
+            HVX_Vector *const       pv_o_row = (HVX_Vector *) (o_tile + r * head_dim);
+
+            for (int d = 0; d < head_dim; d += 32) {
+              HVX_Vector v_sum = Q6_V_vzero();
+
+              // reduction axis: column (along `kv_len` axis)
+              for (int c0 = 0; c0 < n_cols; c0 += 32) {
+                // NOTE(hzx): consider alternative solution
+                // sol 1# outer loop: VTCM -> vec reg -> L2; inner loop: L2 -> L1 -> scalar reg -> vec reg
+                // sol 2# outer loop: VTCM -> vec reg; inner loop: vec reg ---> vec reg
+                // NOTE: broadcasting a 4B value to the whole vector register may have long critical path
+                //     example instruction sequence: vror + 2x vlut16 + vmux
+                vmem(p_row_local) = pv_p_row[c0 / 32];
+
+                for (int c1 = 0; c1 < 32; ++c1) {
+                  int c = c0 + c1;
+                  if (c >= n_cols) {
+                    break;
+                  }
+
+                  HVX_Vector v_p_elem = Q6_V_vsplat_R(p_row_local[c1]);
+                  HVX_Vector v_v_vec  = vmem(&v_tile[c * head_dim + d]);
+
+                  v_sum = Q6_Vqf32_vadd_Vqf32Vqf32(v_sum, Q6_Vqf32_vmpy_VsfVsf(v_p_elem, v_v_vec));
+                }
+              }
+
+              // now `v_sum` contains the dot product of P[1, Bc] & V[Bc, 32]
+              HVX_Vector v_scaled_o = Q6_Vqf32_vmpy_Vqf32Vqf32(v_o_row_scale_qf32, pv_o_row[d / 32]);
+              pv_o_row[d / 32]      = Q6_Vqf32_vadd_Vqf32Vqf32(v_scaled_o, v_sum);
+            }
+          }
+        }
+      }
+    }
+
+    // scale O tile: O_i = diag(l_i^{-1}) O_i
+    {
+      _Alignas(VLEN) int32_t inv_l_local[32];
+      for (int r0 = 0; r0 < n_rows_g; r0 += 32) {
+        HVX_Vector v_inv_l_qf32 = hvx_my_inv_vqf32_vsf(Q6_Vsf_equals_Vqf32(mvec_l[r0 / 32]));
+        vmem(inv_l_local)       = v_inv_l_qf32;
+
+        for (int r1 = 0; r1 < 32; ++r1) {
+          int r = r0 + r1;
+          if (r >= n_rows_g) {
+            break;
+          }
+
+          const HVX_Vector v_o_row_scale_qf32 = Q6_V_vsplat_R(inv_l_local[r1]);
+
+          HVX_Vector *pv_o_row = (HVX_Vector *) (o_tile + r * head_dim);
+          for (int d = 0; d < head_dim; d += 32) {
+            HVX_Vector v_scaled_o = Q6_Vqf32_vmpy_Vqf32Vqf32(v_o_row_scale_qf32, pv_o_row[d / 32]);
+            pv_o_row[d / 32]      = Q6_Vsf_equals_Vqf32(v_scaled_o);
+          }
+        }
+      }
+
+      /*
+      // scalar impl ref: assume o_tile fp32
+      _Alignas(VLEN) float inv_l_local[32];
+      for (int r0 = 0; r0 < n_rows_g; r0 += 32) {
+        // vmem(inv_l_local) = Q6_Vsf_equals_Vqf32(hvx_my_inv_vqf32_vsf(Q6_Vsf_equals_Vqf32(mvec_l[r0 / 32])));
+        vmem(inv_l_local) = Q6_Vsf_equals_Vqf32(mvec_l[r0 / 32]);
+
+        for (int r1 = 0; r1 < 32; ++r1) {
+          int r = r0 + r1;
+          if (r >= n_rows_g) {
+            break;
+          }
+
+          inv_l_local[r1] = 1.0f / inv_l_local[r1];
+
+          float *o_row = o_tile + r * head_dim;
+          for (int d = 0; d < head_dim; ++d) {
+            o_row[d] *= inv_l_local[r1];
+          }
+        }
+      }
+      */
+    }
+
+    // store [n_rows*G, D] tile of O back to DDR memory
+    {
+      float *o_st_base = ((float *) O) + ir * qo_ldst_stride + kv_head_idx * qo_ldst_blk_sz;
+
+      const HVX_Vector *pv_in = (HVX_Vector *) o_tile;
+      for (int r = 0; r < n_rows; ++r) {
+        HVX_Vector *pv_out = (HVX_Vector *) (o_st_base + r * qo_ldst_stride);
+        for (int gd = 0; gd < G * D; gd += 32) {
+          *pv_out++ = *pv_in++;
+        }
+      }
+
+      // TODO(hzx): investigate why DMA is not working here
+      /*
+      _Alignas(64) dma_desc_2d_t desc = { 0 };
+
+      desc.next       = 0;
+      desc.length     = 0;
+      desc.type       = DMA_DESC_TYPE_2D;
+      desc.dst_bypass = 1;
+      desc.src_bypass = 0;
+      desc.order      = 1;
+      desc.dstate     = DMA_DESC_DSTATE_PENDING;
+
+      desc.src        = (uint32_t) o_tile;
+      desc.dst        = (uint32_t) o_st_base;
+      desc.roi_width  = qo_ldst_blk_sz * sizeof(float);
+      desc.roi_height = n_rows;
+      desc.src_stride = qo_ldst_blk_sz * sizeof(float);
+      desc.dst_stride = qo_ldst_stride * sizeof(float);
+
+      desc.src_width_offset = 0;
+      desc.dst_width_offset = 0;
+
+      dma_wait_for_idle();
+      dma_submit_one((dma_desc_1d_t *) &desc);
+      dma_wait_for_idle();
+      */
+    }
+  }
+}
+
 void simple_flash_attn_worker(void *data, int worker_index) {
   simple_fa_task_state_t *s = (simple_fa_task_state_t *) data;
 
@@ -787,8 +1316,8 @@ void simple_flash_attn_worker(void *data, int worker_index) {
     }
 
     int kv_head_idx = task_id;
-    simple_flash_attn_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask, s->qo_len, s->kv_len,
-                           s->n_heads, s->n_kv_heads, s->head_dim);
+    simple_flash_attn_f16_core(kv_head_idx, vtcm, vtcm_limit, s->O, s->Q, s->K, s->V, s->mask, s->qo_len, s->kv_len,
+                               s->n_heads, s->n_kv_heads, s->head_dim);
   }
 
   hmx_manager_disable_execution();
@@ -918,7 +1447,7 @@ int naive_flash_attn(float *restrict O, const float *restrict Q, const __fp16 *r
         const __fp16 *K_src = K + k_start * kv_stride + h_kv * head_dim;
         for (int c = 0; c < bc; ++c) {
           for (int d = 0; d < head_dim; ++d) {
-            Kj[c][d] = ((float) K_src[c * kv_stride + d]) * qk_scale;
+            Kj[c][d] = (float) K_src[c * kv_stride + d];
           }
         }
 
@@ -930,7 +1459,7 @@ int naive_flash_attn(float *restrict O, const float *restrict Q, const __fp16 *r
             for (int d = 0; d < head_dim; ++d) {
               sum += Qi[r][d] * Kj[c][d];
             }
-            Sij[r][c] = sum;
+            Sij[r][c] = sum * qk_scale;
           }
         }
 

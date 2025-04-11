@@ -1,6 +1,7 @@
 #include <HAP_farf.h>
 #include <HAP_perf.h>
 
+#include "dsp/hvx_convert.h"
 #include "dsp/hvx_math.h"
 #include "dsp/vtcm_mgr.h"
 
@@ -11,7 +12,7 @@ static void precompute_safe_softmax_exp2_table() {
     return;
   }
 
-  const int n = 32768; // 32k fp16 elements in 64k area
+  const int n = 32768;  // 32k fp16 elements in 64k area
 
   const int n_elems_per_vec = VLEN / sizeof(__fp16);
   const int n_vecs          = n / n_elems_per_vec;
@@ -27,7 +28,13 @@ static void precompute_safe_softmax_exp2_table() {
       tmp[j]    = index | 0x8000;  // negative value
     }
 
-    *pv_table++ = hvx_my_exp2_vhf_vqf16(vmem(tmp));
+    // *pv_table++ = hvx_my_exp2_vhf_vqf16(vmem(tmp));
+
+    // promote computation precision
+    HVX_VectorPair vp    = hvx_my_vqf16_to_wsf(vmem(tmp));
+    HVX_Vector     v0_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp));
+    HVX_Vector     v1_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp));
+    *pv_table++          = hvx_my_wsf_to_vhf(v1_sf, v0_sf);
   }
   int64_t elapsed_us = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
 
