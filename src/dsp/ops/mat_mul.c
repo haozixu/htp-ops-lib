@@ -17,10 +17,23 @@
 #include "HAP_farf.h"
 #include "HAP_perf.h"
 
-#define WEIGHT_AREA_SIZE     (1 * 1048576)
-#define ACTIVATION_AREA_SIZE (1 * 1048576)
-#define OUTPUT_AREA_SIZE     (1 * 1048576)
-#define SCRATCH_AREA_SIZE    (1 * 1048576)
+#define WEIGHT_AREA_SIZE     (1 * 1024 * 1024)
+#define ACTIVATION_AREA_SIZE (1 * 1024 * 1024)
+#define OUTPUT_AREA_SIZE     (1 * 1024 * 1024)
+#define SCRATCH_AREA_SIZE    (1 * 1024 * 1024)
+
+static const __fp16 q4_0_to_fp16_lut[64] __attribute__((aligned(VLEN))) = {
+  -8, 0, -7, 0, -6, 0, -5, 0, -4, 0, -3, 0, -2, 0, -1, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0,
+};
+
+static const __fp16 iq4_nl_to_fp16_lut[64] __attribute__((aligned(VLEN))) = {
+  -127, 0, -104, 0, -83, 0, -65, 0, -49, 0, -35, 0, -22, 0, -10, 0,
+  1,    0, 13,   0, 25,  0, 38,  0, 53,  0, 69,  0, 89,  0, 113, 0,
+};
+
+static const uint32_t common_layout_vscatter_offsets_base[32] __attribute__((aligned(VLEN))) = {
+  0, 128, 256, 384, 512, 640, 768, 896, 1024, 1152, 1280, 1408, 1536, 1664, 1792, 1920,
+};
 
 static inline void swap_ptr(void **p1, void **p2) {
   void *t = *p1;
@@ -31,6 +44,7 @@ static inline void swap_ptr(void **p1, void **p2) {
 static inline size_t get_super_block_size(enum ggml_type weight_type) {
   switch (weight_type) {
     case GGML_TYPE_Q4_0:
+    case GGML_TYPE_IQ4_NL:
       return sizeof(my_block_q4_0);
     case GGML_TYPE_Q8_0:
       return sizeof(my_block_q8_0);
@@ -47,7 +61,7 @@ static inline int dma_issue_load_from_ddr(dma_desc_1d_t *desc, void *vtcm_dst, c
   desc->type       = DMA_DESC_TYPE_1D;
   desc->src_bypass = 1;
   desc->dst_bypass = 0;
-  desc->order      = 1;
+  desc->ordered    = 1;
   desc->dstate     = DMA_DESC_DSTATE_PENDING;
   desc->src        = (uint32_t) src;
   desc->dst        = (uint32_t) vtcm_dst;
@@ -58,7 +72,7 @@ static inline int dma_issue_load_from_ddr(dma_desc_1d_t *desc, void *vtcm_dst, c
 static void find_chunk_size(size_t x_max, size_t y_max, size_t xy_max, size_t x_unit, size_t y_unit, size_t *x_out,
                             size_t *y_out) {
   int64_t best_xy = 0;
-  size_t  best_x, best_y;
+  size_t  best_x = 0, best_y = 0;
 
   for (size_t x = x_max; x > 0; x -= x_unit) {
     size_t  y  = smin(align_down(xy_max / x, y_unit), y_max);
@@ -114,14 +128,10 @@ static void transfer_activation_chunk_fp32_to_fp16(__fp16 *restrict vtcm_dst, co
 }
 
 typedef struct {
-  worker_synctoken_t sync_ctx;
-  unsigned int       task_id;
-  int                n_tasks;
-  int                n_tot_chunks;
-  int                n_chunks_per_task;
-  int                k;
-  __fp16            *dst;
-  const __fp16      *src;
+  EXPAND_COMMON_TASK_STATE_MEMBERS
+  int           k;
+  __fp16       *dst;
+  const __fp16 *src;
 } permuted_weight_transfer_fp16_task_state_t;
 
 static void transfer_permuted_weight_fp16_task(__fp16 *restrict vtcm_dst, const __fp16 *restrict src, int k,
@@ -195,13 +205,10 @@ static void transfer_permuted_weight_chunk_fp16(__fp16 *vtcm_dst, const __fp16 *
   // size_t n_chunks_per_task = 1;
 
   permuted_weight_transfer_fp16_task_state_t state;
-  state.task_id           = 0;                                          // task id counter
-  state.n_tasks           = ceil_div(n_tot_chunks, n_chunks_per_task);  // old value: n_cols / HMX_FP16_TILE_N_COLS
-  state.n_tot_chunks      = n_tot_chunks;
-  state.n_chunks_per_task = n_chunks_per_task;
-  state.k                 = k;
-  state.dst               = vtcm_dst;
-  state.src               = src;
+  INIT_COMMON_TASK_STATE_MEMBERS(state, n_tot_chunks, n_chunks_per_task);
+  state.k   = k;
+  state.dst = vtcm_dst;
+  state.src = src;
 
   worker_pool_job_t job;
   job.fptr = transfer_permuted_weight_fp16_worker_loop;
@@ -215,15 +222,13 @@ static void transfer_permuted_weight_chunk_fp16(__fp16 *vtcm_dst, const __fp16 *
 }
 
 typedef struct {
-  worker_synctoken_t sync_ctx;
-  unsigned int       task_id;
-  int                n_tasks;
-  int                n_tot_chunks;  // number of total super-blocks
-  int                n_chunks_per_task;
-  __fp16            *dst;
-  const void        *src;
-  enum ggml_type     quant_type;
-  bool               src_in_vtcm;
+  EXPAND_COMMON_TASK_STATE_MEMBERS
+  // NOTE: n_tot_chunks = number of total super-blocks
+  __fp16        *dst;
+  const void    *src;
+  enum ggml_type quant_type;
+  bool           src_in_vtcm;
+  int            k;  // NOTE(hzx): only used in non-pre-permuted (common) weight case
 } permuted_weight_dequantize_qk_0_hvx_task_state_t;
 
 #define EXPAND_QK_0_VEC_SCALES_COMPUTATION(blk, vs0_c, vs1_c, vs2_c, vs3_c) \
@@ -252,16 +257,63 @@ typedef struct {
     vs3_c = Q6_V_valign_VVR(vs7, vs6, 64);                                  \
   } while (0)
 
-static void dequantize_permuted_weight_q4_0_to_fp16_hvx_task(__fp16 *restrict vtcm_dst,
-                                                             const my_block_q4_0 *restrict src, int n_blocks,
-                                                             bool src_in_vtcm) {
+static inline HVX_Vector dequantize_single_q4_0_group(const block_q4_0 *group, const HVX_Vector vlut_cvt) {
+  HVX_Vector vq = vmemu(&(group->quants));
+  HVX_Vector vs = vmemu(&(group->scale));
+
+  HVX_Vector v_scales = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), vs, 0));
+
+  HVX_Vector v_qs_lo = vq;
+  HVX_Vector v_qs_hi = Q6_Vub_vlsr_VubR(vq, 4);
+
+  // concat lo & hi --> 32 elements in a group
+  HVX_Vector v_lo_rot = Q6_V_vror_VR(v_qs_lo, 16);
+  HVX_Vector v_quants = Q6_V_vlalign_VVR(v_qs_hi, v_lo_rot, 16);
+
+  // convert INT4 -> FP16
+  HVX_VectorPair vp = Q6_Wh_vlut16_VbVhR_nomatch(v_quants, vlut_cvt, 0);
+
+  HVX_Vector v_group_hf = Q6_V_lo_W(Q6_W_vshuff_VVR(Q6_V_hi_W(vp), Q6_V_lo_W(vp), -2));
+
+  // // convert INT4 -> FP16
+  // HVX_VectorPair vp_q0 = Q6_Wh_vlut16_VbVhR_nomatch(v_qs_lo, vlut_cvt, 0);
+  // HVX_VectorPair vp_q1 = Q6_Wh_vlut16_VbVhR_nomatch(v_qs_hi, vlut_cvt, 0);
+
+  // HVX_Vector v0 = Q6_V_lo_W(Q6_W_vshuff_VVR(Q6_V_hi_W(vp_q0), Q6_V_lo_W(vp_q0), -2));  // 16 valid elements
+  // HVX_Vector v1 = Q6_V_lo_W(Q6_W_vshuff_VVR(Q6_V_hi_W(vp_q1), Q6_V_hi_W(vp_q1), -2));  // 16 valid elements
+
+  // // concat v0 & v1 --> 32 elements in a group
+  // HVX_Vector v0_rot     = Q6_V_vror_VR(v0, 32);
+  // HVX_Vector v_group_hf = Q6_V_vlalign_VVR(v1, v0_rot, 32);
+
+  // dequantize: quants(FP16) * values(FP16)
+  v_group_hf = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(v_group_hf, v_scales));
+  return v_group_hf;
+}
+
+static inline HVX_Vector dequantize_single_q8_0_group(const block_q8_0 *group) {
+  HVX_Vector vq = vmemu(&(group->quants));
+  HVX_Vector vs = vmemu(&(group->scale));
+
+  HVX_Vector v_scales = Q6_V_lo_W(Q6_Wh_vlut16_VbVhR_nomatch(Q6_V_vzero(), vs, 0));
+
+  HVX_Vector v0         = Q6_V_lo_W(Q6_Wh_vunpack_Vb(vq));
+  HVX_Vector v_group_hf = Q6_Vhf_equals_Vh(v0);
+
+  // dequantize: quants(FP16) * values(FP16)
+  v_group_hf = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(v_group_hf, v_scales));
+  return v_group_hf;
+}
+
+void dequantize_permuted_weight_q4_0_to_fp16_hvx_task(__fp16 *restrict vtcm_dst, const my_block_q4_0 *restrict src,
+                                                      int n_blocks, bool src_in_vtcm, bool is_iq4_nl) {
   const int L2_PREFETCH_N_BLOCKS = 32;  // ~ 4K
   const int DC_PREFETCH_N_BLOCKS = 4;
 
-  static const __fp16 q4_0_to_fp16_lut[64] __attribute__((aligned(VLEN))) = {
-    -8, 0, -7, 0, -6, 0, -5, 0, -4, 0, -3, 0, -2, 0, -1, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0,
-  };
-  const HVX_Vector vlut_cvt = vmem(q4_0_to_fp16_lut);
+  const bool no_group_coalesce = false;
+  const bool no_dequantization = false;
+
+  const HVX_Vector vlut_cvt = is_iq4_nl ? vmem(iq4_nl_to_fp16_lut) : vmem(q4_0_to_fp16_lut);
 
   static const uint8_t vlut_scales_idx_data[128] __attribute__((aligned(VLEN))) = {
     0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2,
@@ -275,7 +327,7 @@ static void dequantize_permuted_weight_q4_0_to_fp16_hvx_task(__fp16 *restrict vt
   HVX_Vector *pv_out = (HVX_Vector *) vtcm_dst;
 
   for (int i = 0; i < n_blocks; ++i) {
-    if (!src_in_vtcm) {
+    if (!src_in_vtcm && false) {
       if (i % L2_PREFETCH_N_BLOCKS == 0) {
         int prefetch_idx = i + L2_PREFETCH_N_BLOCKS;
         if (prefetch_idx < n_blocks) {
@@ -289,7 +341,44 @@ static void dequantize_permuted_weight_q4_0_to_fp16_hvx_task(__fp16 *restrict vt
       }
     }
 
+    if (no_group_coalesce) {
+      const block_q4_0 *groups = (const block_q4_0 *) (src + i);
+
+      HVX_Vector v_g0 = dequantize_single_q4_0_group(groups + 0, vlut_cvt);
+      HVX_Vector v_g1 = dequantize_single_q4_0_group(groups + 1, vlut_cvt);
+      HVX_Vector v_g2 = dequantize_single_q4_0_group(groups + 2, vlut_cvt);
+      HVX_Vector v_g3 = dequantize_single_q4_0_group(groups + 3, vlut_cvt);
+      HVX_Vector v_g4 = dequantize_single_q4_0_group(groups + 4, vlut_cvt);
+      HVX_Vector v_g5 = dequantize_single_q4_0_group(groups + 5, vlut_cvt);
+      HVX_Vector v_g6 = dequantize_single_q4_0_group(groups + 6, vlut_cvt);
+      HVX_Vector v_g7 = dequantize_single_q4_0_group(groups + 7, vlut_cvt);
+
+      HVX_Vector v_g0_rot = Q6_V_vror_VR(v_g0, 64);
+      HVX_Vector v_g2_rot = Q6_V_vror_VR(v_g2, 64);
+      HVX_Vector v_g4_rot = Q6_V_vror_VR(v_g4, 64);
+      HVX_Vector v_g6_rot = Q6_V_vror_VR(v_g6, 64);
+
+      HVX_Vector v0 = Q6_V_vlalign_VVR(v_g1, v_g0_rot, 64);
+      HVX_Vector v1 = Q6_V_vlalign_VVR(v_g3, v_g2_rot, 64);
+      HVX_Vector v2 = Q6_V_vlalign_VVR(v_g5, v_g4_rot, 64);
+      HVX_Vector v3 = Q6_V_vlalign_VVR(v_g7, v_g6_rot, 64);
+
+      *pv_out++ = v0;
+      *pv_out++ = v1;
+      *pv_out++ = v2;
+      *pv_out++ = v3;
+      continue;
+    }
+
     HVX_Vector qs = vmemu(src[i].quants);
+
+    if (no_dequantization) {
+      *pv_out++ = qs;
+      *pv_out++ = qs;
+      *pv_out++ = qs;
+      *pv_out++ = qs;
+      continue;
+    }
 
     HVX_Vector v_qs_lo = qs;  // no need to mask out high 4 bits in each byte since vlut will do that for us
     HVX_Vector v_qs_hi = Q6_Vub_vlsr_VubR(qs, 4);
@@ -317,11 +406,13 @@ static void dequantize_permuted_weight_q4_0_to_fp16_hvx_task(__fp16 *restrict vt
   }
 }
 
-static void dequantize_permuted_weight_q8_0_to_fp16_hvx_task(__fp16 *restrict vtcm_dst,
-                                                             const my_block_q8_0 *restrict src, int n_blocks,
-                                                             bool src_in_vtcm) {
+void dequantize_permuted_weight_q8_0_to_fp16_hvx_task(__fp16 *restrict vtcm_dst, const my_block_q8_0 *restrict src,
+                                                      int n_blocks, bool src_in_vtcm) {
   const int L2_PREFETCH_N_BLOCKS = 16;  // ~ 4K
   const int DC_PREFETCH_N_BLOCKS = 4;
+
+  const bool no_group_coalesce = false;
+  const bool no_dequantization = false;
 
   static const uint8_t vlut_scales_idx_data[128] __attribute__((aligned(VLEN))) = {
     0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2,
@@ -335,7 +426,7 @@ static void dequantize_permuted_weight_q8_0_to_fp16_hvx_task(__fp16 *restrict vt
   HVX_Vector *pv_out = (HVX_Vector *) vtcm_dst;
 
   for (int i = 0; i < n_blocks; ++i) {
-    if (!src_in_vtcm) {
+    if (!src_in_vtcm && false) {
       if (i % L2_PREFETCH_N_BLOCKS == 0) {
         int prefetch_idx = i + L2_PREFETCH_N_BLOCKS;
         if (prefetch_idx < n_blocks) {
@@ -349,8 +440,45 @@ static void dequantize_permuted_weight_q8_0_to_fp16_hvx_task(__fp16 *restrict vt
       }
     }
 
+    if (no_group_coalesce) {
+      const block_q8_0 *groups = (const block_q8_0 *) (src + i);
+
+      HVX_Vector v_g0 = dequantize_single_q8_0_group(groups + 0);
+      HVX_Vector v_g1 = dequantize_single_q8_0_group(groups + 1);
+      HVX_Vector v_g2 = dequantize_single_q8_0_group(groups + 2);
+      HVX_Vector v_g3 = dequantize_single_q8_0_group(groups + 3);
+      HVX_Vector v_g4 = dequantize_single_q8_0_group(groups + 4);
+      HVX_Vector v_g5 = dequantize_single_q8_0_group(groups + 5);
+      HVX_Vector v_g6 = dequantize_single_q8_0_group(groups + 6);
+      HVX_Vector v_g7 = dequantize_single_q8_0_group(groups + 7);
+
+      HVX_Vector v_g0_rot = Q6_V_vror_VR(v_g0, 64);
+      HVX_Vector v_g2_rot = Q6_V_vror_VR(v_g2, 64);
+      HVX_Vector v_g4_rot = Q6_V_vror_VR(v_g4, 64);
+      HVX_Vector v_g6_rot = Q6_V_vror_VR(v_g6, 64);
+
+      HVX_Vector v0 = Q6_V_vlalign_VVR(v_g1, v_g0_rot, 64);
+      HVX_Vector v1 = Q6_V_vlalign_VVR(v_g3, v_g2_rot, 64);
+      HVX_Vector v2 = Q6_V_vlalign_VVR(v_g5, v_g4_rot, 64);
+      HVX_Vector v3 = Q6_V_vlalign_VVR(v_g7, v_g6_rot, 64);
+
+      *pv_out++ = v0;
+      *pv_out++ = v1;
+      *pv_out++ = v2;
+      *pv_out++ = v3;
+      continue;
+    }
+
     HVX_Vector vq0 = vmemu(src[i].quants);
     HVX_Vector vq1 = vmemu(src[i].quants + VLEN);
+
+    if (no_dequantization) {
+      *pv_out++ = vq0;
+      *pv_out++ = vq0;
+      *pv_out++ = vq1;
+      *pv_out++ = vq1;
+      continue;
+    }
 
     HVX_VectorPair vp0 = Q6_Wh_vunpack_Vb(vq0);
     HVX_VectorPair vp1 = Q6_Wh_vunpack_Vb(vq1);
@@ -394,9 +522,10 @@ static void dequantize_permuted_weight_qk_0_to_fp16_hvx_worker_loop(void *data, 
 
     __fp16 *vtcm_dst = state->dst + chunk_idx * QK_K;
 
-    if (state->quant_type == GGML_TYPE_Q4_0) {
+    if (state->quant_type == GGML_TYPE_Q4_0 || state->quant_type == GGML_TYPE_IQ4_NL) {
       const my_block_q4_0 *src = ((const my_block_q4_0 *) state->src) + chunk_idx;
-      dequantize_permuted_weight_q4_0_to_fp16_hvx_task(vtcm_dst, src, chunk_size, state->src_in_vtcm);
+      dequantize_permuted_weight_q4_0_to_fp16_hvx_task(vtcm_dst, src, chunk_size, state->src_in_vtcm,
+                                                       state->quant_type == GGML_TYPE_IQ4_NL);
     } else if (state->quant_type == GGML_TYPE_Q8_0) {
       const my_block_q8_0 *src = ((const my_block_q8_0 *) state->src) + chunk_idx;
       dequantize_permuted_weight_q8_0_to_fp16_hvx_task(vtcm_dst, src, chunk_size, state->src_in_vtcm);
@@ -406,9 +535,10 @@ static void dequantize_permuted_weight_qk_0_to_fp16_hvx_worker_loop(void *data, 
   worker_pool_synctoken_jobdone(&(state->sync_ctx));
 }
 
-static void dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(__fp16 *vtcm_dst, const void *src, int ne,
-                                                              enum ggml_type type, void *vtcm_scratch) {
+void dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(__fp16 *vtcm_dst, const void *src, int ne, int k,
+                                                       enum ggml_type type, void *vtcm_scratch) {
   assert(ne % QK_K == 0);
+  (void) k;
 
   const bool src_in_vtcm = true;
 
@@ -417,14 +547,11 @@ static void dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(__fp16 *vtcm_dst, 
   size_t n_chunks_per_task = ceil_div(n_tot_chunks, n_workers);
 
   permuted_weight_dequantize_qk_0_hvx_task_state_t state;
-  state.task_id           = 0;
-  state.n_tasks           = ceil_div(n_tot_chunks, n_chunks_per_task);
-  state.n_tot_chunks      = n_tot_chunks;
-  state.n_chunks_per_task = n_chunks_per_task;
-  state.dst               = vtcm_dst;
-  state.src               = src_in_vtcm ? vtcm_scratch : src;
-  state.quant_type        = type;
-  state.src_in_vtcm       = src_in_vtcm;
+  INIT_COMMON_TASK_STATE_MEMBERS(state, n_tot_chunks, n_chunks_per_task);
+  state.dst         = vtcm_dst;
+  state.src         = src_in_vtcm ? vtcm_scratch : src;
+  state.quant_type  = type;
+  state.src_in_vtcm = src_in_vtcm;
 
   worker_pool_job_t job;
   job.fptr = dequantize_permuted_weight_qk_0_to_fp16_hvx_worker_loop;
@@ -440,6 +567,136 @@ static void dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(__fp16 *vtcm_dst, 
 
   // int64_t e = HAP_perf_qtimer_count_to_us(HAP_perf_get_qtimer_count() - t0);
   // FARF(ALWAYS, "QK_0 dequantize: ne: %d time: %lld us", ne, e);
+}
+
+void dequantize_common_weight_q4_0_to_fp16_hvx_task(__fp16 *restrict vtcm_dst, const block_q4_0 *restrict src,
+                                                    int start_group_idx, int end_group_idx, int k, bool src_in_vtcm,
+                                                    bool is_iq4_nl) {
+  assert(src_in_vtcm);
+
+  const size_t GROUP_SIZE = QK_0;
+  assert(GROUP_SIZE == HMX_FP16_TILE_N_ROWS);
+
+  const size_t N_GROUPS_PER_SCALAR_COLUMN = k / GROUP_SIZE;
+  const size_t N_GROUPS_PER_TILE_COLUMN   = N_GROUPS_PER_SCALAR_COLUMN * HMX_FP16_TILE_N_COLS;
+
+  const HVX_Vector vlut_cvt       = is_iq4_nl ? vmem(iq4_nl_to_fp16_lut) : vmem(q4_0_to_fp16_lut);
+  const HVX_Vector v_offsets_base = vmem(common_layout_vscatter_offsets_base);
+
+  const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+
+  for (int g_idx = start_group_idx; g_idx < end_group_idx; ++g_idx) {
+    const block_q4_0 *group = src + g_idx;
+
+    HVX_Vector v_group_hf = dequantize_single_q4_0_group(group, vlut_cvt);
+
+    // prepare for scatter
+    int i0 = g_idx / N_GROUPS_PER_TILE_COLUMN;
+    int i1 = g_idx % N_GROUPS_PER_TILE_COLUMN;
+
+    int gr = i1 % N_GROUPS_PER_SCALAR_COLUMN;
+    int gc = i1 / N_GROUPS_PER_SCALAR_COLUMN;
+
+    int     tile_idx  = i0 * (k / HMX_FP16_TILE_N_ROWS) + gr;
+    __fp16 *tile_base = vtcm_dst + tile_idx * HMX_FP16_TILE_N_ELMS;
+
+    HVX_Vector v_offsets_delta = Q6_V_vsplat_R(gc * 4);
+    HVX_Vector v_offsets       = Q6_Vw_vadd_VwVw(v_offsets_base, v_offsets_delta);
+    Q6_vscatter_QRMVwV(q_32_elems_mask, (size_t) tile_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_group_hf);
+  }
+}
+
+void dequantize_common_weight_q8_0_to_fp16_hvx_task(__fp16 *restrict vtcm_dst, const block_q8_0 *restrict src,
+                                                    int start_group_idx, int end_group_idx, int k, bool src_in_vtcm) {
+  const size_t GROUP_SIZE = QK_0;
+  assert(GROUP_SIZE == HMX_FP16_TILE_N_ROWS);
+
+  const size_t N_GROUPS_PER_SCALAR_COLUMN = k / GROUP_SIZE;
+  const size_t N_GROUPS_PER_TILE_COLUMN   = N_GROUPS_PER_SCALAR_COLUMN * HMX_FP16_TILE_N_COLS;
+
+  const HVX_Vector v_offsets_base = vmem(common_layout_vscatter_offsets_base);
+
+  const HVX_VectorPred q_32_elems_mask = Q6_Q_vsetq_R(32 * sizeof(__fp16));
+
+  for (int g_idx = start_group_idx; g_idx < end_group_idx; ++g_idx) {
+    const block_q8_0 *group = src + g_idx;
+
+    HVX_Vector v_group_hf = dequantize_single_q8_0_group(group);
+
+    // prepare for scatter
+    int i0 = g_idx / N_GROUPS_PER_TILE_COLUMN;
+    int i1 = g_idx % N_GROUPS_PER_TILE_COLUMN;
+
+    int gr = i1 % N_GROUPS_PER_SCALAR_COLUMN;
+    int gc = i1 / N_GROUPS_PER_SCALAR_COLUMN;
+
+    int     tile_idx  = i0 * (k / HMX_FP16_TILE_N_ROWS) + gr;
+    __fp16 *tile_base = vtcm_dst + tile_idx * HMX_FP16_TILE_N_ELMS;
+
+    HVX_Vector v_offsets_delta = Q6_V_vsplat_R(gc * 4);
+    HVX_Vector v_offsets       = Q6_Vw_vadd_VwVw(v_offsets_base, v_offsets_delta);
+    Q6_vscatter_QRMVwV(q_32_elems_mask, (size_t) tile_base, HMX_FP16_TILE_SIZE - 1, v_offsets, v_group_hf);
+  }
+}
+
+static void dequantize_common_weight_chunk_qk_0_to_fp16_hvx_worker_loop(void *data, int _worker_index) {
+  (void) _worker_index;
+  permuted_weight_dequantize_qk_0_hvx_task_state_t *state = (permuted_weight_dequantize_qk_0_hvx_task_state_t *) data;
+
+  const int     k        = state->k;
+  __fp16 *const vtcm_dst = state->dst;
+
+  while (1) {
+    unsigned int task_id = worker_pool_atomic_inc_return(&(state->task_id)) - 1;
+    if (task_id >= state->n_tasks) {
+      break;
+    }
+
+    size_t start_idx = task_id * state->n_chunks_per_task;
+    size_t end_idx   = smin(start_idx + state->n_chunks_per_task, state->n_tot_chunks);
+
+    if (state->quant_type == GGML_TYPE_Q4_0 || state->quant_type == GGML_TYPE_IQ4_NL) {
+      const block_q4_0 *src = (const block_q4_0 *) state->src;
+      dequantize_common_weight_q4_0_to_fp16_hvx_task(vtcm_dst, src, start_idx, end_idx, k, state->src_in_vtcm,
+                                                     state->quant_type == GGML_TYPE_IQ4_NL);
+    } else if (state->quant_type == GGML_TYPE_Q8_0) {
+      const block_q8_0 *src = (const block_q8_0 *) state->src;
+      dequantize_common_weight_q8_0_to_fp16_hvx_task(vtcm_dst, src, start_idx, end_idx, k, state->src_in_vtcm);
+    }
+  }
+
+  worker_pool_synctoken_jobdone(&(state->sync_ctx));
+}
+
+void dequantize_common_weight_chunk_qk_0_to_fp16_hvx(__fp16 *vtcm_dst, const void *src, int ne, int k,
+                                                     enum ggml_type type, void *vtcm_scratch) {
+  assert(ne % QK_0 == 0);
+  assert(k % QK_0 == 0);
+
+  const bool src_in_vtcm = true;
+
+  int    n_workers         = num_hvx128_contexts;
+  size_t n_tot_chunks      = ne / QK_0;
+  size_t n_chunks_per_task = ceil_div(n_tot_chunks, n_workers);
+
+  // NOTE: reuse the task state type for now
+  permuted_weight_dequantize_qk_0_hvx_task_state_t state;
+  INIT_COMMON_TASK_STATE_MEMBERS(state, n_tot_chunks, n_chunks_per_task);
+  state.dst         = vtcm_dst;
+  state.src         = src_in_vtcm ? vtcm_scratch : src;
+  state.quant_type  = type;
+  state.src_in_vtcm = src_in_vtcm;
+  state.k           = k;
+
+  worker_pool_job_t job;
+  job.fptr = dequantize_common_weight_chunk_qk_0_to_fp16_hvx_worker_loop;
+  job.dptr = &state;
+
+  worker_pool_synctoken_init(&(state.sync_ctx), n_workers);
+  for (int i = 0; i < n_workers; ++i) {
+    worker_pool_submit(NULL, job);  // use default worker pool
+  }
+  worker_pool_synctoken_wait(&(state.sync_ctx));
 }
 
 static void core_dot_chunk_fp16(__fp16 *output, const __fp16 *activation, const __fp16 *weight, const __fp16 *scales,
@@ -513,7 +770,7 @@ int hmx_mat_mul_permuted_w16a32(float *restrict dst, const float *restrict activ
 
   const size_t weight_area_size     = WEIGHT_AREA_SIZE;
   const size_t activation_area_size = ACTIVATION_AREA_SIZE;
-  const size_t output_area_size     = WEIGHT_AREA_SIZE;
+  const size_t output_area_size     = OUTPUT_AREA_SIZE;
 
   // VTCM layout: weight | activation | output | scales
   uint8_t *vtcm_ptr        = (uint8_t *) vtcm_manager_get_vtcm_base();
@@ -618,7 +875,7 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
 
   const size_t weight_area_size     = WEIGHT_AREA_SIZE;
   const size_t activation_area_size = ACTIVATION_AREA_SIZE;
-  const size_t output_area_size     = WEIGHT_AREA_SIZE;
+  const size_t output_area_size     = OUTPUT_AREA_SIZE;
   const size_t scratch_area_size    = SCRATCH_AREA_SIZE;
 
   // VTCM layout: weight | activation | output | scales
@@ -691,8 +948,8 @@ int hmx_mat_mul_permuted_qk_0_d16a32(float *restrict dst, const float *restrict 
         }
 
         const uint8_t *permuted_weight_chunk = permuted_weight + (nc * k / QK_K) * super_block_size;
-        dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight, permuted_weight_chunk, n_cols * k, weight_type,
-                                                          buf_curr);
+        dequantize_permuted_weight_chunk_qk_0_to_fp16_hvx(vtcm_weight, permuted_weight_chunk, n_cols * k, k,
+                                                          weight_type, buf_curr);
 
         swap_ptr(&buf_curr, &buf_next);
       }

@@ -18,6 +18,7 @@ size_t ggml_super_block_size(enum ggml_type type) {
   // TODO: more types
   switch (type) {
     case GGML_TYPE_Q4_0:
+    case GGML_TYPE_IQ4_NL:
       return sizeof(my_block_q4_0);
     case GGML_TYPE_Q8_0:
       return sizeof(my_block_q8_0);
@@ -34,6 +35,8 @@ enum ggml_type matmul_op_to_weight_type(enum HtpOpsIndex op) {
       return GGML_TYPE_Q4_0;
     case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
       return GGML_TYPE_Q8_0;
+    case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL:
+      return GGML_TYPE_IQ4_NL;
     default:
       return GGML_TYPE_COUNT;  // invalid type
   }
@@ -110,6 +113,7 @@ int execute_op_simple(struct OpComputeRequest *req) {
 
     case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32:
     case HTP_OPS_MAT_MUL_PERMUTED_W8D16A32:
+    case HTP_OPS_MAT_MUL_PERMUTED_W4D16A32_IQ4_NL:
       {
         auto   weight_type      = matmul_op_to_weight_type(static_cast<HtpOpsIndex>(req->op));
         size_t super_block_size = ggml_super_block_size(weight_type);

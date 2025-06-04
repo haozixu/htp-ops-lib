@@ -4,7 +4,14 @@
 
 #define QK_K 256  // super-block size
 
+#define QK_0 32 // NOTE: This may be subject to change
+
 #define QK4_0 32
+
+typedef struct {
+  __fp16  scale;
+  uint8_t quants[QK4_0 / 2];
+} __attribute__((packed)) block_q4_0;
 
 typedef struct {
   __fp16  scales[8];
@@ -12,6 +19,11 @@ typedef struct {
 } __attribute__((packed)) my_block_q4_0;
 
 #define QK8_0 32
+
+typedef struct {
+  __fp16  scale;
+  uint8_t quants[QK8_0];
+} __attribute__((packed)) block_q8_0;
 
 typedef struct {
   __fp16 scales[8];

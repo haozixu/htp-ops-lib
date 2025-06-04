@@ -21,13 +21,13 @@ void power_setup() {
 
   req.dcvs_v3.set_core_params           = TRUE;
   req.dcvs_v3.core_params.min_corner    = HAP_DCVS_VCORNER_NOM;
-  req.dcvs_v3.core_params.max_corner    = HAP_DCVS_VCORNER_TURBO_PLUS;
-  req.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_TURBO_PLUS;
+  req.dcvs_v3.core_params.max_corner    = HAP_DCVS_VCORNER_TURBO_L3;
+  req.dcvs_v3.core_params.target_corner = HAP_DCVS_VCORNER_TURBO_L3;
 
   req.dcvs_v3.set_bus_params           = TRUE;
   req.dcvs_v3.bus_params.min_corner    = HAP_DCVS_VCORNER_NOM;
-  req.dcvs_v3.bus_params.max_corner    = HAP_DCVS_VCORNER_TURBO_PLUS;
-  req.dcvs_v3.bus_params.target_corner = HAP_DCVS_VCORNER_TURBO_PLUS;
+  req.dcvs_v3.bus_params.max_corner    = HAP_DCVS_VCORNER_TURBO_L3;
+  req.dcvs_v3.bus_params.target_corner = HAP_DCVS_VCORNER_TURBO_L3;
 
   err = HAP_power_set(&power_ctx, &req);
   if (err != AEE_SUCCESS) {

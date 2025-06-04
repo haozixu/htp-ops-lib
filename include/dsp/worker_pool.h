@@ -293,4 +293,20 @@ static inline unsigned int worker_pool_atomic_dec_return(unsigned int *target) {
 }
 #endif
 
+#define EXPAND_COMMON_TASK_STATE_MEMBERS \
+  worker_synctoken_t sync_ctx;           \
+  unsigned int       task_id;            \
+  int                n_tasks;            \
+  int                n_tot_chunks;       \
+  int                n_chunks_per_task;
+
+// `sync_ctx` need to be initialized separately
+#define INIT_COMMON_TASK_STATE_MEMBERS(state, n_tot_chunks, n_chunks_per_task)            \
+  do {                                                                                    \
+    state.task_id           = 0;                                                          \
+    state.n_tasks           = (n_tot_chunks + n_chunks_per_task - 1) / n_chunks_per_task; \
+    state.n_tot_chunks      = n_tot_chunks;                                               \
+    state.n_chunks_per_task = n_chunks_per_task;                                          \
+  } while (0)
+
 #endif  // #ifndef WORKER_H

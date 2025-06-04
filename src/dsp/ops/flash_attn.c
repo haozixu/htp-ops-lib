@@ -148,7 +148,8 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   const bool   qo_fp32_element = true;  // whether Q/O has fp32 elements
   const size_t qo_element_size = qo_fp32_element ? sizeof(float) : sizeof(__fp16);
 
-  const bool enable_vgather_exp = true;  // use table lookup (vgather) to compute exp, experimental
+  const bool enable_vgather_exp = true;   // use table lookup (vgather) to compute exp, experimental
+  const bool use_fp32_exp       = false;  // compute FP32 exp
 
   // determine block sizes
   size_t blk_sz_r, blk_sz_c;  // Br, Bc
@@ -157,7 +158,7 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
 
   const size_t g_br = align_up(G * blk_sz_r, HMX_FP16_TILE_N_ROWS);  // Br'
 
-  FARF(ALWAYS, "%s: Br=%d Bc=%d Br'=%d", __func__, blk_sz_r, blk_sz_c, g_br);
+  // FARF(ALWAYS, "%s: Br=%d Bc=%d Br'=%d", __func__, blk_sz_r, blk_sz_c, g_br);
 
   const size_t n_tiles_per_blk_r = g_br / HMX_FP16_TILE_N_ROWS;
   const size_t n_tiles_per_blk_c = blk_sz_c / HMX_FP16_TILE_N_COLS;
@@ -515,8 +516,21 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
                 HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(row_buffer0[c / 64], v_dup_m0);  // qf16
                 HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(row_buffer1[c / 64], v_dup_m1);  // qf16
 
-                v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
-                v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
+                if (use_fp32_exp) {
+                  HVX_VectorPair vp_s_minus_m0_sf = hvx_my_vqf16_to_wsf(v_s_minus_m0);
+                  HVX_VectorPair vp_s_minus_m1_sf = hvx_my_vqf16_to_wsf(v_s_minus_m1);
+
+                  HVX_Vector v_p_row00_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m0_sf));
+                  HVX_Vector v_p_row01_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m0_sf));
+                  HVX_Vector v_p_row10_sf = hvx_my_exp2_vsf(Q6_V_lo_W(vp_s_minus_m1_sf));
+                  HVX_Vector v_p_row11_sf = hvx_my_exp2_vsf(Q6_V_hi_W(vp_s_minus_m1_sf));
+
+                  v_p_row0_hf = hvx_my_wsf_to_vhf(v_p_row01_sf, v_p_row00_sf);
+                  v_p_row1_hf = hvx_my_wsf_to_vhf(v_p_row11_sf, v_p_row10_sf);
+                } else {
+                  v_p_row0_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m0);
+                  v_p_row1_hf = hvx_my_exp2_vhf_vqf16(v_s_minus_m1);
+                }
               }
 
               // compute P tile output positions
@@ -887,7 +901,7 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
       desc.type       = DMA_DESC_TYPE_2D;
       desc.dst_bypass = 0;
       desc.src_bypass = 1;                        // bypass L2 cache
-      desc.order      = 1;                        // ordered, doesn't matter
+      desc.ordered    = 1;                        // ordered, doesn't matter
       desc.dstate     = DMA_DESC_DSTATE_PENDING;  // to be processed
 
       desc.src        = (uint32_t) q_ld_base;
@@ -1341,7 +1355,7 @@ int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16
 
   const int    n_workers            = num_hvx128_contexts;
   const size_t vtcm_size_per_thread = 1024 * 1024;
-  assert(n_workers * vtcm_size_per_thread < 6 * 1024 * 1024);  // don't use too much VTCM
+  assert(n_workers * vtcm_size_per_thread <= 6 * 1024 * 1024);  // don't use too much VTCM
 
   simple_fa_task_state_t state;
   state.O          = O;

@@ -28,10 +28,11 @@ struct dma_desc_1d {
     struct {
       unsigned length     : 24;
       unsigned type       : 2;
-      unsigned _pad0      : 2;
+      unsigned dst_dlbc   : 1;
+      unsigned src_dlbc   : 1;
       unsigned dst_bypass : 1;
       unsigned src_bypass : 1;
-      unsigned order      : 1;
+      unsigned ordered    : 1;
       unsigned dstate     : 1;
     } __attribute__((packed));
 
@@ -49,10 +50,11 @@ struct dma_desc_2d {
     struct {
       unsigned length     : 24;
       unsigned type       : 2;
-      unsigned _pad0      : 2;
+      unsigned dst_dlbc   : 1;
+      unsigned src_dlbc   : 1;
       unsigned dst_bypass : 1;
       unsigned src_bypass : 1;
-      unsigned order      : 1;
+      unsigned ordered    : 1;
       unsigned dstate     : 1;
     } __attribute__((packed));
 

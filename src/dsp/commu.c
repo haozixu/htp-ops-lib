@@ -38,7 +38,7 @@ static void msg_receiver_loop(void *param) {
   struct MessageChannel *chan = (struct MessageChannel *) param;
   qurt_signal_set(&(chan->msg_receiver_ready), 1);
 
-  const int SLEEP_TIME_US = 5;
+  const int SLEEP_TIME_US = 1;
 
   // TODO(hzx): using the poller thread to do computation may not be a good idea
   hmx_manager_enable_execution();
