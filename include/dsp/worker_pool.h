@@ -81,6 +81,8 @@ WORKERPOOL_API extern unsigned int num_hvx128_contexts;
 // Declarations
 //==============================================================================
 
+WORKERPOOL_API AEEResult worker_pool_init_ex(worker_pool_context_t *context, int stack_size, int n_workers, int allow_hmx);
+
 //---------------------------------------------------------------------------
 /// @brief
 ///   Initialize a worker pool. Should be called by each control thread that

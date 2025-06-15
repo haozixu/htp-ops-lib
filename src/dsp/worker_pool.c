@@ -1,29 +1,3 @@
-/**=============================================================================
-
-@file
-   worker_pool.cpp
-
-@brief
-   Utility providing a multi-priority thread worker pool for
-   multi-threaded computer vision (or other compute) applications.
-
-Copyright (c) 2019-2020 Qualcomm Technologies Incorporated.
-All Rights Reserved. Qualcomm Proprietary and Confidential.
-
-Export of this technology or software is regulated by the U.S.
-Government. Diversion contrary to U.S. law prohibited.
-
-All ideas, data and information contained in or disclosed by
-this document are confidential and proprietary information of
-Qualcomm Technologies Incorporated and all rights therein are expressly reserved.
-By accepting this material the recipient agrees that this material
-and the information contained therein are held in confidence and in
-trust and will not be used, copied, reproduced in whole or in part,
-nor its contents revealed in any manner to others without the express
-written permission of Qualcomm Technologies Incorporated.
-
-=============================================================================**/
-
 /*===========================================================================
     INCLUDE FILE
 ===========================================================================*/
@@ -32,6 +6,8 @@ written permission of Qualcomm Technologies Incorporated.
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "dsp/hmx_mgr.h"
 
 #ifndef _DEBUG
 #  define _DEBUG
@@ -90,6 +66,7 @@ typedef union {
 typedef struct {
   worker_pool_t *pool;
   int            worker_index;
+  int            allow_hmx;
 } worker_info_t;
 
 /*===========================================================================
@@ -121,6 +98,10 @@ static void worker_pool_main(void *context) {
   unsigned int      mask   = me->job_queue_mask;
   qurt_mutex_t     *mutex  = &me->queued_jobs_mutex;
 
+  if (info->allow_hmx) {
+    hmx_manager_enable_execution();
+  }
+
   while (1) {
     qurt_mutex_lock(mutex);  // mutex only allows 1 thread to wait on signal at a time. QuRT restriction.
     (void) qurt_anysignal_wait(signal, mask);                             // wait for a job
@@ -135,13 +116,18 @@ static void worker_pool_main(void *context) {
     } else if (WORKER_KILL_SIGNAL == sig_rx) {
       // don't clear the kill signal, leave it for all the workers to see, and exit
       qurt_mutex_unlock(mutex);
-      qurt_thread_exit(0);
+      break;
     } else {
       FARF(HIGH, "Worker pool received invalid job %d", sig_rx);
       qurt_mutex_unlock(mutex);
     }
     // else ignore
   }
+
+  if (info->allow_hmx) {
+    hmx_manager_enable_execution();
+  }
+  qurt_thread_exit(0);
 }
 
 void worker_pool_constructor() {
@@ -169,7 +155,7 @@ void worker_pool_constructor() {
   }
 }
 
-AEEResult worker_pool_init_with_stack_size(worker_pool_context_t *context, int stack_size) {
+AEEResult worker_pool_init_ex(worker_pool_context_t *context, int stack_size, int num_workers, int allow_hmx) {
   int nErr = 0;
 
   if (stack_size <= 0) {
@@ -252,6 +238,7 @@ AEEResult worker_pool_init_with_stack_size(worker_pool_context_t *context, int s
     // extra worker info containing worker index
     info[i].pool         = me;
     info[i].worker_index = i;
+    info[i].allow_hmx    = allow_hmx;
 
     // launch
     nErr = qurt_thread_create(&(me->thread[i]), &attr, worker_pool_main, (void *) &info[i]);
@@ -263,6 +250,10 @@ AEEResult worker_pool_init_with_stack_size(worker_pool_context_t *context, int s
   }
   *context = (worker_pool_context_t *) me;
   return AEE_SUCCESS;
+}
+
+AEEResult worker_pool_init_with_stack_size(worker_pool_context_t *context, int stack_size) {
+  return worker_pool_init_ex(context, stack_size, num_workers /* global */, 0);
 }
 
 AEEResult worker_pool_init(worker_pool_context_t *context) {

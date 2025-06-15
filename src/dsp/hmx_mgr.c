@@ -1,10 +1,13 @@
 #include "dsp/hmx_mgr.h"
+#include "dsp/worker_pool.h"
 
 #include <HAP_compute_res.h>
 #include <HAP_farf.h>
 
 static int hmx_mgr_ctx_id;
 static int hmx_mgr_spin_lock;
+
+worker_pool_context_t hmx_worker_pool_ctx; 
 
 void hmx_manager_setup() {
   // NOTE(hzx): HMX should be already powered up in power_setup()
@@ -18,9 +21,18 @@ void hmx_manager_setup() {
     FARF(ALWAYS, "%s: HAP_compute_res_acquire failed", __func__);
     return;
   }
+
+  int err = worker_pool_init_ex(&hmx_worker_pool_ctx, 8192, 1, 1);
+  if (err) {
+    FARF(ALWAYS, "%s: HMX worker pool init failed", __func__);
+  }
 }
 
 void hmx_manager_reset() {
+  if (hmx_worker_pool_ctx) {
+    worker_pool_deinit(&hmx_worker_pool_ctx);
+  }
+
   if (hmx_mgr_ctx_id) {
     HAP_compute_res_release(hmx_mgr_ctx_id);
   }
