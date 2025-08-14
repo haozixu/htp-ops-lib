@@ -148,6 +148,9 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   const bool   qo_fp32_element = true;  // whether Q/O has fp32 elements
   const size_t qo_element_size = qo_fp32_element ? sizeof(float) : sizeof(__fp16);
 
+  const bool   has_qk_mask = (qk_mask != NULL);
+  const size_t kv_pad_len  = align_up(kv_len, 64);
+
   const bool enable_vgather_exp = true;   // use table lookup (vgather) to compute exp, experimental
   const bool use_fp32_exp       = false;  // compute FP32 exp
 
@@ -441,16 +444,23 @@ void simple_flash_attn_f16_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
               int q_idx1 = ir + (r + 1) / G;
               int k_idx  = jc + c;
 
-              // hope this won't cause out-of-bounds access
-              HVX_Vector v_mask0 = vmemu(qk_mask + q_idx0 * kv_len + k_idx);
-              HVX_Vector v_mask1 = vmemu(qk_mask + q_idx1 * kv_len + k_idx);
+              HVX_VectorPred q_mask_keep0, q_mask_keep1;
+              if (has_qk_mask) {
+                HVX_Vector v_mask0 = vmemu(qk_mask + q_idx0 * kv_pad_len + k_idx);
+                HVX_Vector v_mask1 = vmemu(qk_mask + q_idx1 * kv_pad_len + k_idx);
+              
+                const HVX_Vector v_fp16_mask_threshold = Q6_Vh_vsplat_R(0xcc00);  // fp16: -16.0
 
-              const HVX_Vector v_fp16_mask_threshold = Q6_Vh_vsplat_R(0xcc00);  // fp16: -16.0
-              HVX_VectorPred   q_mask_out0           = Q6_Q_vcmp_gt_VhfVhf(v_fp16_mask_threshold, v_mask0);
-              HVX_VectorPred   q_mask_out1           = Q6_Q_vcmp_gt_VhfVhf(v_fp16_mask_threshold, v_mask1);
+                q_mask_keep0 = Q6_Q_vcmp_gt_VhfVhf(v_mask0, v_fp16_mask_threshold);
+                q_mask_keep1 = Q6_Q_vcmp_gt_VhfVhf(v_mask1, v_fp16_mask_threshold);
+              } else {
+                const size_t ne = smin(n_cols - c, 64);
 
-              HVX_Vector v_s_row0 = Q6_V_vmux_QVV(q_mask_out0, v_neg_inf, row_buffer0[c / 64]);
-              HVX_Vector v_s_row1 = Q6_V_vmux_QVV(q_mask_out1, v_neg_inf, row_buffer1[c / 64]);
+                q_mask_keep0 = q_mask_keep1 = Q6_Q_vsetq2_R(ne * sizeof(__fp16));
+              }
+
+              HVX_Vector v_s_row0 = Q6_V_vmux_QVV(q_mask_keep0, row_buffer0[c / 64], v_neg_inf);
+              HVX_Vector v_s_row1 = Q6_V_vmux_QVV(q_mask_keep1, row_buffer1[c / 64], v_neg_inf);
 
               row_buffer0[c / 64] = v_s_row0;
               row_buffer1[c / 64] = v_s_row1;
@@ -843,6 +853,9 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
   const int G = n_heads / n_kv_heads;  // group size
   const int D = head_dim;
 
+  const bool   has_qk_mask = (qk_mask != NULL);
+  const size_t kv_pad_len  = align_up(kv_len, 64);
+
   const float qk_scale = 1.0f / sqrtf(head_dim) * 1.44269504f;
 
   const size_t qo_ldst_stride = n_heads * head_dim;
@@ -1034,7 +1047,8 @@ void simple_flash_attn_f32_core(int kv_head_idx, uint8_t *vtcm, uint8_t *vtcm_li
               int q_idx = ir + r / G;
               int k_idx = jc + c;
 
-              HVX_Vector     v_mask_hf  = vmemu(qk_mask + q_idx * kv_len + k_idx);
+              // TODO(hzx): handle leftover mask when qk_mask == null
+              HVX_Vector     v_mask_hf  = has_qk_mask ? vmemu(qk_mask + q_idx * kv_pad_len + k_idx) : Q6_V_vzero();
               HVX_VectorPair vp_mask_sf = hvx_my_vhf_to_wsf(v_mask_hf);
               HVX_Vector     v_mask_sf  = Q6_V_lo_W(Q6_W_vshuff_VVR(Q6_V_hi_W(vp_mask_sf), Q6_V_lo_W(vp_mask_sf), -4));
 
@@ -1339,6 +1353,10 @@ void simple_flash_attn_worker(void *data, int worker_index) {
   worker_pool_synctoken_jobdone(&(s->sync_ctx));
 }
 
+int simple_flash_attn_sp_hdim(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K,
+                              const __fp16 *restrict V, const __fp16 *restrict mask, int qo_len, int kv_len,
+                              int n_heads, int n_kv_heads, int head_dim);
+
 /**
  * Simple llama.cpp-style FlashAttention implementation
  *
@@ -1349,7 +1367,11 @@ void simple_flash_attn_worker(void *data, int worker_index) {
  */
 int simple_flash_attn(__fp16 *restrict O, const __fp16 *restrict Q, const __fp16 *restrict K, const __fp16 *restrict V,
                       const __fp16 *restrict mask, int qo_len, int kv_len, int n_heads, int n_kv_heads, int head_dim) {
-  if (head_dim % 64 != 0 || n_heads % n_kv_heads != 0) {
+  if (head_dim % 64 != 0) {
+    return simple_flash_attn_sp_hdim(O, Q, K, V, mask, qo_len, kv_len, n_heads, n_kv_heads, head_dim);
+  }
+  if (n_heads % n_kv_heads != 0) {
+    FARF(ALWAYS, "FA not supported: head_dim=%d n_heads=%d n_kv_heads=%d", head_dim, n_heads, n_kv_heads);
     return -1;
   }
 
@@ -1412,6 +1434,8 @@ int naive_flash_attn(float *restrict O, const float *restrict Q, const __fp16 *r
   }
 
   const int gqa_factor = n_heads / n_kv_heads;
+
+  const size_t kv_pad_len = align_up(kv_len, 64);
 
   const size_t qo_stride = n_heads * head_dim;
   const size_t kv_stride = n_kv_heads * head_dim;
@@ -1481,7 +1505,7 @@ int naive_flash_attn(float *restrict O, const float *restrict Q, const __fp16 *r
         if (mask != NULL) {
           for (int r = 0; r < br; ++r) {
             for (int c = 0; c < bc; ++c) {
-              const int mask_idx = (q_start + r) * kv_len + (k_start + c);
+              const int mask_idx = (q_start + r) * kv_pad_len + (k_start + c);
               Sij[r][c] += (float) mask[mask_idx];
             }
           }
